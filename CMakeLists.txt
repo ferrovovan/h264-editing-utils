@@ -27,4 +27,9 @@ endif()
 
 add_compile_options(-Wall -Wextra)
 
+enable_testing()
+
 add_subdirectory(source)
+
+add_test(NAME integration
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/run.sh $<TARGET_FILE:h264-cut>)
