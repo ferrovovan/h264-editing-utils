@@ -1180,8 +1180,99 @@ PYEOF
         "$MP4CUT" -f 5 "$WORK/src.mp4"
     check_rc "T30 -f beyond the track is refused (exit 3)" 3 \
         "$MP4CUT" -f 100000 -o "$WORK/x.mp4" "$WORK/src.mp4"
+
+    # --- T38: mp4-cut plan (dry run) mirrors the cut decision --------------
+    "$MP4CUT" -l -f 50 "$WORK/src.mp4" >"$WORK/mplan.txt" 2>/dev/null
+    check_eq "T38 mp4-cut plan exit 0" "0" "$?"
+    if grep -q "snap назад на sync → 40" "$WORK/mplan.txt" \
+            && grep -q "запишет: сэмплы \[40..99\] (60)" "$WORK/mplan.txt"; then
+        eq38=ok
+    else
+        eq38="missing snap/запишет lines"
+    fi
+    check_eq "T38 mp4-cut plan explains the snap and the result" "ok" "$eq38"
+    check_eq "T38 mp4-cut plan count == real cut count (60)" "60" \
+        "$(mp4_frames "$WORK/c1.mp4")"
+    check_rc "T38 mp4-cut -l with -o is refused (exit 1)" 1 \
+        "$MP4CUT" -l -f 5 -o "$WORK/x.mp4" "$WORK/src.mp4"
 else
     skip_note "T25..T30 mp4-cut (testsrc/libx264 unavailable)"
+fi
+
+# ---------------------------------------------------------------------------
+# T35..T37: dry-run plan (-l together with -f/-t/-e). The plan's numbers
+#      must match the REAL cut — that is the whole point of sharing the
+#      planner code. --smart plan lines are gated on smart support.
+# ---------------------------------------------------------------------------
+
+"$BIN" -l -f 45 -t 100 "$S7" >"$WORK/plan_copy.txt" 2>"$WORK/plan_copy.err"
+check_eq "T35 plan copy exit 0" "0" "$?"
+if grep -q "план вырезки" "$WORK/plan_copy.txt" \
+        && grep -q "copy:  запись \[40..100\] (61)" "$WORK/plan_copy.txt" \
+        && grep -q "краевые кадры" "$WORK/plan_copy.txt"; then
+    eq35a=ok
+else
+    eq35a="missing lines: $(head -3 "$WORK/plan_copy.txt" | tr '\n' '|')"
+fi
+check_eq "T35 plan copy explains the snap to IDR 40" "ok" "$eq35a"
+check_rc "T35 plan printed nothing on stderr" 0 \
+    test ! -s "$WORK/plan_copy.err"
+# plan vs reality: the copy cut really writes what the plan promised
+"$BIN" -f 45 -t 100 -o "$WORK/plan_cut.264" "$S7" 2>/dev/null
+check_eq "T35 real copy cut count == plan (61)" "61" \
+    "$("$BIN" -l "$WORK/plan_cut.264" | awk 'NR>1' | wc -l | tr -d ' ')"
+if [ "$smart" = 1 ]; then
+    "$BIN" -l --smart -f 45 -t 100 "$S7" >"$WORK/plan_smart.txt" 2>/dev/null
+    if grep -q "smart: перекод \[45..79\]" "$WORK/plan_smart.txt" \
+            && grep -q "копия \[80..100\]" "$WORK/plan_smart.txt"; then
+        eq35b=ok
+    else
+        eq35b="no smart lines: $(grep smart: "$WORK/plan_smart.txt" | head -1)"
+    fi
+    check_eq "T35 plan smart shows re-encode [45..79] + copy [80..100]" \
+        "ok" "$eq35b"
+    "$BIN" --smart -f 45 -t 100 -o "$WORK/plan_scut.264" "$S7" 2>/dev/null
+    check_eq "T35 real smart cut count == plan (56)" "56" \
+        "$("$BIN" -l "$WORK/plan_scut.264" | awk 'NR>1' | wc -l | tr -d ' ')"
+else
+    skip_note "T35 plan smart lines (no smart support)"
+fi
+
+# T36: --exact plan + refusal matrix
+"$BIN" -l -e 0:00:01.800-0:00:03.200 "$S7" >"$WORK/plan_x.txt" 2>/dev/null
+check_eq "T36 plan --exact exit 0" "0" "$?"
+if grep -q "display-ранги \[45..79\]" "$WORK/plan_x.txt" \
+        && grep -q "политика коробки" "$WORK/plan_x.txt"; then
+    eq36=ok
+else
+    eq36="missing exact lines"
+fi
+check_eq "T36 plan --exact names display ranks and box policy" "ok" "$eq36"
+check_rc "T36 -l with -o is refused (exit 1)" 1 \
+    "$BIN" -l -f 5 -o "$WORK/x.264" "$S7"
+check_rc "T36 --list --smart without a range is refused (exit 1)" 1 \
+    "$BIN" --list --smart "$S7"
+
+# T37: json plan parses and agrees with the text plan
+"$BIN" -l --json -f 45 -t 100 "$S7" >"$WORK/plan.json" 2>/dev/null
+if "$PY" - "$WORK/plan.json" <<'PYEOF'
+import json, sys
+p = json.load(open(sys.argv[1]))
+assert p["plan"] == 1 and p["mode"] == "copy"
+assert p["request"] == {"kind": "frames", "from": 45, "to": 100}
+assert p["box"] == {"first": 45, "last": 100, "count": 56}
+c = p["copy"]
+assert c["ok"] and c["start"] == 40 and c["written"] == 61 \
+    and c["added_for_decode"] == 5
+e = {fr["dec_id"]: fr["fate"] for fr in p["edges"]}
+assert 40 in e and "copy_anchor_start" in e[40]
+assert 44 in e and "lost_left_of_box" in e[44]
+assert 101 in e and "lost_right_of_box" in e[101]
+PYEOF
+then
+    ok "T37 json plan structure matches the text plan"
+else
+    ko "T37 json plan structure matches the text plan"
 fi
 
 # ---------------------------------------------------------------------------

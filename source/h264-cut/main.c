@@ -67,8 +67,9 @@ typedef struct {
 static void usage(FILE *out)
 {
     fputs("usage: h264-cut [опции] INPUT.264\n"
-          "  -l, --list            список кадров в stdout и выход 0"
-          " (не совместимо с -f/-t/-e/-o);\n"
+          "  -l, --list            список кадров; с -f/-t/-e (опц. --smart)"
+          " — ПЛАН вырезки\n"
+          "                        без записи файла; с -o — ошибка\n"
           "                        колонка t — display-время (сек),"
           " суффиксы типа: L — leading\n"
           "                        picture открытой GOP, R — recovery point\n"
@@ -381,9 +382,15 @@ static int parse_args(int argc, char **argv, opts_t *opt)
         return EXIT_USAGE;
     }
     if (opt->list_mode) {
-        if (opt->have_from || opt->have_to || opt->exact_mode || opt->output
-                || opt->smart_mode) {
-            ERR("--list is not compatible with -f/-t/-e/-o/--smart\n");
+        /* -l alone lists frames; -l together with -f/-t/-e (optionally
+         * --smart) is a DRY-RUN: print the cut plan, write nothing. */
+        if (opt->output) {
+            ERR("--list ничего не пишет: -o с --list несовместим\n");
+            return EXIT_USAGE;
+        }
+        if (opt->smart_mode && !opt->have_from && !opt->have_to
+                && !opt->exact_mode) {
+            ERR("--smart вместе с --list требует диапазона (-f/-t/-e)\n");
             return EXIT_USAGE;
         }
     } else {
@@ -397,6 +404,12 @@ static int parse_args(int argc, char **argv, opts_t *opt)
         }
     }
     return EXIT_OK;
+}
+
+static int plan_mode(const opts_t *opt)
+{
+    return opt->list_mode
+        && (opt->have_from || opt->have_to || opt->exact_mode);
 }
 
 static uint8_t *read_whole_file(const char *path, size_t *out_size)
@@ -613,10 +626,29 @@ static int find_last_nal_type(const stream_index_t *idx, uint8_t type,
     return -1;
 }
 
+/* Extra facts about an --exact selection, for the dry-run plan report. */
+typedef struct {
+    int active;        /* selection was --exact */
+    int clock_base;    /* times came from SEI picture timing (VFR) */
+    long long d_min, d_max;   /* display ranks kept (fps path) */
+    long double fps;   /* time base used (0 when clock_base) */
+} exact_meta_t;
+
+static int cut_bounds_ex(const stream_index_t *idx, const opts_t *opt,
+                         size_t *a0, size_t *b0, exact_meta_t *em);
+
 /* Compute the kept decoding-order index range [a0, b0]. Returns 0, 2 or 3. */
 static int cut_bounds(const stream_index_t *idx, const opts_t *opt,
                       size_t *a0, size_t *b0)
 {
+    return cut_bounds_ex(idx, opt, a0, b0, NULL);
+}
+
+static int cut_bounds_ex(const stream_index_t *idx, const opts_t *opt,
+                         size_t *a0, size_t *b0, exact_meta_t *em)
+{
+    if (em)
+        memset(em, 0, sizeof(*em));
     if (opt->exact_mode) {
         long double fps = 0.0L;
         int clock_base = 0;
@@ -652,6 +684,11 @@ static int cut_bounds(const stream_index_t *idx, const opts_t *opt,
             ERR("no time base (no fixed-fps VUI timing, no SEI clock ts);"
                 " specify --fps\n");
             return EXIT_STREAM;
+        }
+        if (em) {
+            em->active = 1;
+            em->clock_base = clock_base;
+            em->fps = clock_base ? 0.0L : fps;
         }
 
         if (clock_base) {
@@ -709,6 +746,11 @@ static int cut_bounds(const stream_index_t *idx, const opts_t *opt,
             d_max = ld_ceil_ll(opt->t1 * fps - 1e-9L) - 1;
             if (d_min < 0)
                 d_min = 0;
+            if (em) {
+                em->d_min = d_min;
+                em->d_max = d_max;
+                em->fps = fps;
+            }
             for (i = 0; i < idx->frame_count; i++) {
                 long long disp = idx->frames[i].display_index;
 
@@ -966,38 +1008,32 @@ static int do_cut_copy(const stream_index_t *idx, const uint8_t *buf,
  * re-encoded (decoder warm-up from the anchor feed_first <= a0), the rest
  * of the range is copied byte-for-byte.
  */
-static int do_cut_smart(const stream_index_t *idx, const uint8_t *buf,
-                        const opts_t *opt, size_t a0, size_t b0)
+/*
+ * The --smart segmentation, shared by the executor and the dry-run plan:
+ * decode-order window [a0..b0] splits into re-encode [a0..enc_last] and
+ * byte-copy [copy_first..b0] (copy_first > b0 means "encode to the end"),
+ * with the decoder warmed from feed_first. pure_copy implements rule 5.
+ * Returns 0, or -1 when no anchor exists at or before a0.
+ */
+static int smart_plan(const stream_index_t *idx, size_t a0, size_t b0,
+                      size_t *feed_first, size_t *enc_last,
+                      size_t *copy_first, int *pure_copy)
 {
-    size_t feed_first, next_anchor = 0, enc_first, enc_last, copy_first;
-    size_t n;
-    uint32_t fps_num = 0, fps_den = 0;
-    long double fps;
-    char terr[256];
-    uint8_t *tbuf = NULL;
-    size_t tsize = 0;
-    nal_list_t tnals;
-    FILE *out;
-    int rc;
+    size_t n, next_anchor = 0;
 
-    tnals.items = NULL;
-    tnals.count = 0;
-
-    if (find_anchor_left(idx, a0, &feed_first) != 0) {
-        ERR("no cut anchor (IDR or recovery point) at or before frame %llu\n",
-            (unsigned long long)a0);
-        return EXIT_RANGE;
-    }
+    *pure_copy = 0;
+    if (find_anchor_left(idx, a0, feed_first) != 0)
+        return -1;
     /*
      * A decoder session started at a recovery point drops the leading
      * picture right after it (FFmpeg >= 7 behaviour) and that picture may
      * reference pre-recovery content anyway: warm up from the last IDR at
      * or before a0 when one exists (PLAN rule 4's "previous anchor").
      */
-    if (!idx->frames[feed_first].is_idr) {
+    if (!idx->frames[*feed_first].is_idr) {
         for (n = a0; ; n--) {
             if (idx->frames[n].is_idr) {
-                feed_first = n;
+                *feed_first = n;
                 break;
             }
             if (n == 0)
@@ -1018,13 +1054,14 @@ static int do_cut_smart(const stream_index_t *idx, const uint8_t *buf,
             if (idx->frames[n].leading_picture)
                 need_enc = 1;
         }
-        if (!need_enc)
-            return do_cut_copy(idx, buf, opt, a0, b0);
+        if (!need_enc) {
+            *pure_copy = 1;
+            return 0;
+        }
     }
 
-    enc_first = a0;
-    enc_last = (next_anchor <= b0) ? next_anchor - 1 : b0;
-    copy_first = next_anchor;
+    *enc_last = (next_anchor <= b0) ? next_anchor - 1 : b0;
+    *copy_first = next_anchor;
 
     /*
      * Open GOP: a copy tail may not start at a recovery anchor - the
@@ -1033,14 +1070,44 @@ static int do_cut_smart(const stream_index_t *idx, const uint8_t *buf,
      * (a byte-copy splice breaks them). Extend the re-encode over every
      * such GOP until the copy tail opens on a plain IDR or the range ends.
      */
-    while (copy_first <= b0 && idx->frames[copy_first].recovery_point) {
+    while (*copy_first <= b0 && idx->frames[*copy_first].recovery_point) {
         size_t na;
 
-        if (find_anchor_right(idx, copy_first, &na) != 0)
+        if (find_anchor_right(idx, *copy_first, &na) != 0)
             na = idx->frame_count;
-        enc_last = (na <= b0) ? na - 1 : b0;
-        copy_first = na;
+        *enc_last = (na <= b0) ? na - 1 : b0;
+        *copy_first = na;
     }
+    return 0;
+}
+
+static int do_cut_smart(const stream_index_t *idx, const uint8_t *buf,
+                        const opts_t *opt, size_t a0, size_t b0)
+{
+    size_t feed_first = 0, enc_first, enc_last = 0, copy_first = 0, n;
+    int pure_copy = 0;
+    uint32_t fps_num = 0, fps_den = 0;
+    long double fps;
+    char terr[256];
+    uint8_t *tbuf = NULL;
+    size_t tsize = 0;
+    nal_list_t tnals;
+    FILE *out;
+    int rc;
+
+    tnals.items = NULL;
+    tnals.count = 0;
+
+    if (smart_plan(idx, a0, b0, &feed_first, &enc_last, &copy_first,
+                   &pure_copy) != 0) {
+        ERR("no cut anchor (IDR or recovery point) at or before frame %llu\n",
+            (unsigned long long)a0);
+        return EXIT_RANGE;
+    }
+    if (pure_copy)
+        return do_cut_copy(idx, buf, opt, a0, b0);
+
+    enc_first = a0;
 
     rc = smart_check_limits(idx, feed_first, enc_last);
     if (rc != EXIT_OK)
@@ -1246,6 +1313,403 @@ static int do_cut_copy(const stream_index_t *idx, const uint8_t *buf,
     return EXIT_OK;
 }
 
+/* ------------------------------------------------------------------------
+ * Dry-run plan (--list combined with -f/-t/-e): explains the boundary
+ * decisions without writing anything. The numbers come from the SAME
+ * functions the real cut uses (cut_bounds_ex/find_anchor_left/smart_plan),
+ * so the plan cannot drift from the action.
+ * ---------------------------------------------------------------------- */
+
+enum { TB_NONE = 0, TB_FPS, TB_VUI, TB_CLOCK };
+
+static int plan_time_base(const stream_index_t *idx, const opts_t *opt,
+                          long double *fps_out)
+{
+    long double fps = 0.0L;
+
+    *fps_out = 0.0L;
+    if (opt->have_fps) {
+        *fps_out = opt->fps;
+        return TB_FPS;
+    }
+    if (time_base_fps(idx, &fps) == 0 && fps > 0.0L) {
+        *fps_out = fps;
+        return TB_VUI;
+    }
+    if (idx->clock_timing)
+        return TB_CLOCK;
+    return TB_NONE;
+}
+
+typedef struct {
+    size_t a0, b0;                /* decode-order box */
+    exact_meta_t em;
+    int copy_ok;
+    size_t copy_start;
+    size_t n_leading;
+    int smart_wanted;
+    int smart_ok;
+    int smart_pure;
+    size_t feed_first, enc_last, copy_first;
+} plan_t;
+
+static int plan_compute(const stream_index_t *idx, const opts_t *opt,
+                        plan_t *pl)
+{
+    size_t k;
+    int rc;
+
+    memset(pl, 0, sizeof(*pl));
+    rc = cut_bounds_ex(idx, opt, &pl->a0, &pl->b0, &pl->em);
+    if (rc != EXIT_OK)
+        return rc;
+    pl->copy_ok = find_anchor_left(idx, pl->a0, &pl->copy_start) == 0;
+    for (k = pl->copy_start; pl->copy_ok && k <= pl->b0; k++) {
+        if (idx->frames[k].leading_picture)
+            pl->n_leading++;
+    }
+    pl->smart_wanted = opt->smart_mode;
+    if (pl->smart_wanted && transcode_available()) {
+        if (smart_plan(idx, pl->a0, pl->b0, &pl->feed_first, &pl->enc_last,
+                       &pl->copy_first, &pl->smart_pure) == 0) {
+            /* smart_check_limits prints the reason to stderr itself. */
+            pl->smart_ok = smart_check_limits(idx, pl->feed_first,
+                                              pl->enc_last) == EXIT_OK;
+        }
+    }
+    return EXIT_OK;
+}
+
+/* Edge frames and their fates (code keys for json, Russian for text). */
+enum {
+    FE_ANCHOR, FE_WARMUP, FE_ENC_FIRST, FE_ENC_LAST, FE_COPY_TAIL,
+    FE_BOX_FIRST, FE_LOST_LEFT, FE_LOST_RIGHT, FE_XFIRST, FE_XLAST,
+    FE_WRITE_LAST
+};
+
+static const char *fe_code(int c)
+{
+    switch (c) {
+    case FE_ANCHOR:     return "copy_anchor_start";
+    case FE_WARMUP:     return "smart_warmup_not_written";
+    case FE_ENC_FIRST:  return "smart_encode_first";
+    case FE_ENC_LAST:   return "smart_encode_last";
+    case FE_COPY_TAIL:  return "smart_copy_tail_start";
+    case FE_BOX_FIRST:  return "box_first";
+    case FE_LOST_LEFT:  return "lost_left_of_box";
+    case FE_LOST_RIGHT: return "lost_right_of_box";
+    case FE_XFIRST:     return "exact_display_first";
+    case FE_XLAST:      return "exact_display_last";
+    default:            return "write_last";
+    }
+}
+
+static const char *fe_russian(int c)
+{
+    switch (c) {
+    case FE_ANCHOR:     return "copy: начало записи (якорь)";
+    case FE_WARMUP:     return "smart: прогрев декодера, не пишется";
+    case FE_ENC_FIRST:  return "smart: первый перекодированный";
+    case FE_ENC_LAST:   return "smart: последний перекодированный";
+    case FE_COPY_TAIL:  return "smart: начало побайтовой копии";
+    case FE_BOX_FIRST:  return "первый кадр окна декодирования";
+    case FE_LOST_LEFT:  return "последний кадр до окна (не сохраняется)";
+    case FE_LOST_RIGHT: return "первый кадр после окна (не сохраняется)";
+    case FE_XFIRST:     return "первый display-кадр запроса --exact";
+    case FE_XLAST:      return "последний display-кадр запроса --exact";
+    default:            return "последний сохраняемый";
+    }
+}
+
+#define PLAN_EDGES_MAX 16
+
+typedef struct {
+    size_t dec;
+    int codes[4];
+    int n_codes;
+} plan_edge_t;
+
+static void plan_edge_add(plan_edge_t *ed, size_t *n, size_t dec, int code)
+{
+    size_t i;
+    int j;
+
+    if (dec >= (size_t)-1)
+        return;
+    for (i = 0; i < *n; i++) {
+        if (ed[i].dec == dec) {
+            for (j = 0; j < ed[i].n_codes; j++) {
+                if (ed[i].codes[j] == code)
+                    return;
+            }
+            if (ed[i].n_codes < 4)
+                ed[i].codes[ed[i].n_codes++] = code;
+            return;
+        }
+    }
+    if (*n >= PLAN_EDGES_MAX)
+        return;
+    ed[*n].dec = dec;
+    ed[*n].codes[0] = code;
+    ed[*n].n_codes = 1;
+    (*n)++;
+}
+
+static void plan_edges_build(const stream_index_t *idx, const plan_t *pl,
+                             plan_edge_t *ed, size_t *n)
+{
+    size_t i;
+
+    *n = 0;
+    if (pl->a0 > 0)
+        plan_edge_add(ed, n, pl->a0 - 1, FE_LOST_LEFT);
+    plan_edge_add(ed, n, pl->a0, FE_BOX_FIRST);
+    if (pl->copy_ok && pl->copy_start < pl->a0)
+        plan_edge_add(ed, n, pl->copy_start, FE_ANCHOR);
+    if (pl->smart_ok && !pl->smart_pure) {
+        if (pl->feed_first < pl->a0)
+            plan_edge_add(ed, n, pl->feed_first, FE_WARMUP);
+        plan_edge_add(ed, n, pl->a0, FE_ENC_FIRST);
+        plan_edge_add(ed, n, pl->enc_last, FE_ENC_LAST);
+        if (pl->copy_first <= pl->b0)
+            plan_edge_add(ed, n, pl->copy_first, FE_COPY_TAIL);
+    }
+    if (pl->em.active && !pl->em.clock_base) {
+        for (i = 0; i < idx->frame_count; i++) {
+            if (idx->frames[i].display_index == pl->em.d_min)
+                plan_edge_add(ed, n, i, FE_XFIRST);
+            if (idx->frames[i].display_index == pl->em.d_max)
+                plan_edge_add(ed, n, i, FE_XLAST);
+        }
+    }
+    plan_edge_add(ed, n, pl->b0, FE_WRITE_LAST);
+    if (pl->b0 + 1 < idx->frame_count)
+        plan_edge_add(ed, n, pl->b0 + 1, FE_LOST_RIGHT);
+}
+
+static void plan_edge_print(const stream_index_t *idx, const plan_edge_t *e)
+{
+    const frame_t *f = &idx->frames[e->dec];
+    char t[32], disp[24], type[8], fate[192];
+    int j, used = 0;
+
+    frame_time_str(idx, f, t, sizeof t);
+    if (f->display_index < 0)
+        strcpy(disp, "-");
+    else
+        snprintf(disp, sizeof disp, "%lld", f->display_index);
+    snprintf(type, sizeof type, "%c%s%s", f->pic_type,
+             f->leading_picture ? "L" : "", f->recovery_point ? "R" : "");
+    fate[0] = '\0';
+    for (j = 0; j < e->n_codes; j++) {
+        int w = snprintf(fate + used, sizeof(fate) - (size_t)used, "%s%s",
+                         used ? "; " : "", fe_russian(e->codes[j]));
+        if (w > 0 && (size_t)w < sizeof(fate) - (size_t)used)
+            used += w;
+    }
+    printf("  %-6zu %-6s %-4s %-8s %s\n", e->dec, disp, type, t, fate);
+}
+
+static void plan_text(const stream_index_t *idx, const opts_t *opt,
+                      const plan_t *pl)
+{
+    plan_edge_t ed[PLAN_EDGES_MAX];
+    size_t n, i, box_n = pl->b0 - pl->a0 + 1;
+    long double fps = 0.0L;
+    int tb = plan_time_base(idx, opt, &fps);
+
+    printf("h264-cut: план вырезки (файл не записан)\n");
+    printf("  вход: %zu кадров; таймбаза: ", idx->frame_count);
+    switch (tb) {
+    case TB_FPS:   printf("--fps (%.6Lg)", fps); break;
+    case TB_VUI:   printf("VUI (%.6Lg fps)", fps); break;
+    case TB_CLOCK: printf("SEI picture timing (VFR)"); break;
+    default:       printf("неизвестна"); break;
+    }
+    printf("\n");
+
+    if (opt->exact_mode) {
+        printf("  запрос:  --exact %.3Lf - %.3Lf с", opt->t0, opt->t1);
+        if (pl->em.clock_base)
+            printf(" (отбор по SEI clock)");
+        else
+            printf(" → display-ранги [%lld..%lld]",
+                   pl->em.d_min, pl->em.d_max);
+        printf("\n");
+    } else {
+        printf("  запрос:  кадры [%zu..%zu] (dec, включительно)\n",
+               pl->a0, pl->b0);
+    }
+
+    if (pl->em.active && !pl->em.clock_base) {
+        size_t extra = 0;
+
+        for (i = pl->a0; i <= pl->b0; i++) {
+            long long d = idx->frames[i].display_index;
+
+            if (d >= 0 && (d < pl->em.d_min || d > pl->em.d_max))
+                extra++;
+        }
+        printf("  окно декодирования: [%zu..%zu] (%zu кадров); вне display-"
+               "диапазона %zu (нужны для декодирования — политика коробки)\n",
+               pl->a0, pl->b0, box_n, extra);
+    } else {
+        printf("  окно декодирования: [%zu..%zu] (%zu кадров)\n",
+               pl->a0, pl->b0, box_n);
+    }
+
+    if (!pl->copy_ok) {
+        printf("  copy:  нет якоря (IDR/recovery) перед кадром %zu — "
+               "вырезка невозможна\n", pl->a0);
+    } else if (pl->copy_start == pl->a0) {
+        printf("  copy:  граница на якоре — чистая копия [%zu..%zu] (%zu)\n",
+               pl->a0, pl->b0, box_n);
+    } else {
+        printf("  copy:  запись [%zu..%zu] (%zu); +%zu кадров [%zu..%zu] "
+               "добавлены для декода (запрошенное окно — их надмножество)\n",
+               pl->copy_start, pl->b0, pl->b0 - pl->copy_start + 1,
+               pl->a0 - pl->copy_start, pl->copy_start, pl->a0 - 1);
+    }
+    if (pl->n_leading > 0)
+        printf("         leading-кадров с битыми ссылками в копии: %zu"
+               " (лечится --smart)\n", pl->n_leading);
+
+    if (pl->smart_wanted) {
+        if (!transcode_available())
+            printf("  smart: сборка без поддержки перекодирования\n");
+        else if (!pl->smart_ok)
+            printf("  smart: недоступен для этого диапазона"
+                   " (причина — выше в stderr)\n");
+        else if (pl->smart_pure)
+            printf("  smart: граница на якоре без leading — побайтовая "
+                   "копия, идентичная copy\n");
+        else if (pl->copy_first > pl->b0)
+            printf("  smart: перекод [%zu..%zu] (прогрев с %zu, не "
+                   "пишется), запись [%zu..%zu] (%zu)\n",
+                   pl->a0, pl->enc_last, pl->feed_first,
+                   pl->a0, pl->b0, box_n);
+        else
+            printf("  smart: перекод [%zu..%zu] (прогрев с %zu, не "
+                   "пишется), копия [%zu..%zu]; запись [%zu..%zu] (%zu)\n",
+                   pl->a0, pl->enc_last, pl->feed_first,
+                   pl->copy_first, pl->b0, pl->a0, pl->b0, box_n);
+    } else if (pl->copy_ok && pl->copy_start < pl->a0) {
+        printf("  (--smart сохранил бы запрос [%zu..%zu] без сдвига назад)\n",
+               pl->a0, pl->b0);
+    }
+
+    plan_edges_build(idx, pl, ed, &n);
+    {
+        size_t p, q;
+        for (p = 1; p < n; p++) {
+            plan_edge_t key = ed[p];
+            for (q = p; q > 0 && ed[q - 1].dec > key.dec; q--)
+                ed[q] = ed[q - 1];
+            ed[q] = key;
+        }
+    }
+    printf("  краевые кадры:\n");
+    printf("  %-6s %-6s %-4s %-8s %s\n", "dec", "disp", "type", "t", "судьба");
+    for (i = 0; i < n; i++)
+        plan_edge_print(idx, &ed[i]);
+}
+
+static void plan_json(const stream_index_t *idx, const opts_t *opt,
+                      const plan_t *pl)
+{
+    plan_edge_t ed[PLAN_EDGES_MAX];
+    size_t n, i, box_n = pl->b0 - pl->a0 + 1;
+    long double fps = 0.0L;
+    int tb = plan_time_base(idx, opt, &fps);
+
+    printf("{\"plan\":1,\"mode\":\"%s\",",
+           pl->smart_wanted ? "smart" : "copy");
+    printf("\"input\":{\"frame_count\":%zu,\"time_base\":", idx->frame_count);
+    switch (tb) {
+    case TB_FPS:   fputs("\"fps\"", stdout); break;
+    case TB_VUI:   fputs("\"vui\"", stdout); break;
+    case TB_CLOCK: fputs("\"sei_clock\"", stdout); break;
+    default:       fputs("\"none\"", stdout);
+    }
+    printf(",\"fps\":");
+    if (fps > 0.0L)
+        printf("%.9Lg", fps);
+    else
+        fputs("null", stdout);
+    printf("},\"request\":{");
+    if (opt->exact_mode) {
+        printf("\"kind\":\"exact\",\"t0\":%.9Lg,\"t1\":%.9Lg,"
+               "\"clock_base\":%s,\"d_min\":",
+               opt->t0, opt->t1, pl->em.clock_base ? "true" : "false");
+        if (pl->em.clock_base)
+            fputs("null", stdout);
+        else
+            printf("%lld", pl->em.d_min);
+        printf(",\"d_max\":");
+        if (pl->em.clock_base)
+            fputs("null", stdout);
+        else
+            printf("%lld", pl->em.d_max);
+    } else {
+        printf("\"kind\":\"frames\",\"from\":%zu,\"to\":%zu",
+               pl->a0, pl->b0);
+    }
+    printf("},\"box\":{\"first\":%zu,\"last\":%zu,\"count\":%zu},",
+           pl->a0, pl->b0, box_n);
+    if (pl->copy_ok) {
+        printf("\"copy\":{\"ok\":true,\"start\":%zu,\"written\":%zu,"
+               "\"added_for_decode\":%zu,\"leading_broken\":%zu},",
+               pl->copy_start, pl->b0 - pl->copy_start + 1,
+               pl->a0 - pl->copy_start, pl->n_leading);
+    } else {
+        fputs("\"copy\":{\"ok\":false},", stdout);
+    }
+    printf("\"smart\":{\"wanted\":%s,\"ok\":%s",
+           pl->smart_wanted ? "true" : "false",
+           pl->smart_ok ? "true" : "false");
+    if (pl->smart_ok && !pl->smart_pure) {
+        printf(",\"pure_copy\":false,\"feed_first\":%zu,\"encode_first\":"
+               "%zu,\"encode_last\":%zu,\"copy_first\":%zu,\"written\":%zu",
+               pl->feed_first, pl->a0, pl->enc_last, pl->copy_first, box_n);
+    } else if (pl->smart_ok) {
+        fputs(",\"pure_copy\":true", stdout);
+    }
+    printf("},\"edges\":[");
+    plan_edges_build(idx, pl, ed, &n);
+    {
+        size_t p, q;
+        for (p = 1; p < n; p++) {
+            plan_edge_t key = ed[p];
+            for (q = p; q > 0 && ed[q - 1].dec > key.dec; q--)
+                ed[q] = ed[q - 1];
+            ed[q] = key;
+        }
+    }
+    for (i = 0; i < n; i++) {
+        int j;
+
+        printf("%s{\"dec_id\":%zu,\"fate\":[", i ? "," : "", ed[i].dec);
+        for (j = 0; j < ed[i].n_codes; j++)
+            printf("%s\"%s\"", j ? "," : "", fe_code(ed[i].codes[j]));
+        fputs("]}", stdout);
+    }
+    fputs("]}\n", stdout);
+}
+
+static int do_plan(const stream_index_t *idx, const opts_t *opt)
+{
+    plan_t pl;
+    int rc = plan_compute(idx, opt, &pl);
+
+    if (rc != EXIT_OK)
+        return rc;
+    if (opt->json_mode)
+        plan_json(idx, opt, &pl);
+    else
+        plan_text(idx, opt, &pl);
+    return EXIT_OK;
+}
+
 static int do_cut(const stream_index_t *idx, const uint8_t *buf,
                   const opts_t *opt)
 {
@@ -1303,7 +1767,9 @@ int main(int argc, char **argv)
         goto out;
     }
 
-    if (opt.list_mode)
+    if (opt.list_mode && plan_mode(&opt))
+        rc = do_plan(&idx, &opt);
+    else if (opt.list_mode)
         rc = opt.json_mode ? do_list_json(&idx) : do_list(&idx);
     else
         rc = do_cut(&idx, buf, &opt);

@@ -52,7 +52,9 @@ typedef struct {
 static void usage(FILE *out)
 {
     fputs("usage: mp4-cut [опции] INPUT.mp4\n"
-          "  -l, --list            список сэмплов видео-дорожки и выход 0\n"
+          "  -l, --list            список сэмплов видео-дорожки; с -f/-t/-e"
+          " — план вырезки\n"
+          "                        без записи файла; с -o — ошибка\n"
           "  -f, --from-frame N    первый сохраняемый сэмпл (0-based, порядок\n"
           "                        декодирования; при попадании в середину GOP\n"
           "                        граница сдвигается назад на sync-сэмпл)\n"
@@ -327,6 +329,71 @@ static void print_list(const iso_movie_t *m)
     }
 }
 
+/* Dry-run: same numbers as the real cut (bounds + snap), prints a plan. */
+static void print_plan(const iso_movie_t *m, int exact, long long raw_from,
+                       int have_from, size_t sel_from, size_t a, size_t b)
+{
+    const iso_video_t *v = &m->video;
+    size_t i, n_sync = 0;
+    double ts = v->timescale ? (double)v->timescale : 1.0;
+
+    for (i = 0; i < v->sample_count; i++) {
+        if (v->samples[i].is_sync)
+            n_sync++;
+    }
+    fputs("mp4-cut: план вырезки (файл не записан)\n", stdout);
+    printf("  дорожка: %zu сэмплов; timescale %u; sync-сэмплов: %zu\n",
+           v->sample_count, v->timescale, n_sync);
+    if (exact)
+        printf("  запрос:  --exact: по pts сэмпл [%zu..%zu], snap назад на "
+               "sync → %zu\n", sel_from, b, a);
+    else if (have_from && (size_t)raw_from != a)
+        printf("  запрос:  -f %lld: snap назад на sync → %zu (добавлено "
+               "%zu сэмплов [%zu..%zu] для декода)\n",
+               raw_from, a, (size_t)raw_from - a, a, (size_t)raw_from - 1);
+    else
+        printf("  запрос:  граница уже на sync (сдвиг не нужен)\n");
+    printf("  запишет: сэмплы [%zu..%zu] (%zu)\n", a, b, b - a + 1);
+    fputs("  краевые сэмплы:\n", stdout);
+    fputs("  idx     pts_t     dts_t     key fate\n", stdout);
+    {
+        size_t lo = a > 3 ? a - 3 : 0;
+        size_t hi = b + 1 < v->sample_count ? b + 1 : v->sample_count - 1;
+
+        for (i = lo; i <= hi; i++) {
+            char fbuf[160];
+            size_t used = 0;
+
+            fbuf[0] = '\0';
+            if (!exact && have_from && i == (size_t)raw_from && a != i)
+                used += (size_t)snprintf(fbuf + used, sizeof fbuf - used,
+                        "запрошенный -f (середина GOP, не пишется один)");
+            if (i == a) {
+                used += (size_t)snprintf(fbuf + used, sizeof fbuf - used,
+                        "%sпервый сохраняемый (sync)", used ? "; " : "");
+            }
+            if (i == b) {
+                used += (size_t)snprintf(fbuf + used, sizeof fbuf - used,
+                        "%sпоследний сохраняемый", used ? "; " : "");
+            }
+            if (used == 0 && i < a) {
+                used += (size_t)snprintf(fbuf + used, sizeof fbuf - used,
+                        "не пишется (до sync-начала)");
+            }
+            if (used == 0 && i > b) {
+                used += (size_t)snprintf(fbuf + used, sizeof fbuf - used,
+                        "после конца диапазона");
+            }
+            if (used == 0)
+                continue;
+            printf("%-8zu %-10.3f %-10.3f %-4c %s\n", i,
+                   (double)v->samples[i].pts / ts,
+                   (double)v->samples[i].dts / ts,
+                   v->samples[i].is_sync ? 'K' : '.', fbuf);
+        }
+    }
+}
+
 int main(int argc, char **argv)
 {
     opts_t opt;
@@ -334,7 +401,8 @@ int main(int argc, char **argv)
     size_t size = 0;
     iso_movie_t m;
     char err[256];
-    size_t a, b;
+    size_t a, b, sel_from = 0;
+    long long raw_from = 0;
     int rc;
 
     memset(&opt, 0, sizeof(opt));
@@ -364,9 +432,9 @@ int main(int argc, char **argv)
         return EXIT_STREAM;
     }
 
-    if (opt.list_mode) {
-        if (opt.output || opt.have_from || opt.have_to || opt.exact_mode) {
-            ERR("--list несовместим с вырезанием\n");
+    if (opt.list_mode && !opt.have_from && !opt.have_to && !opt.exact_mode) {
+        if (opt.output) {
+            ERR("--list ничего не пишет: -o с --list несовместим\n");
             iso_close(&m);
             free(buf);
             return EXIT_USAGE;
@@ -376,8 +444,13 @@ int main(int argc, char **argv)
         free(buf);
         return EXIT_OK;
     }
-
-    if (!opt.output) {
+    if (opt.list_mode && opt.output) {
+        ERR("план ничего не пишет: -o с --list несовместим\n");
+        iso_close(&m);
+        free(buf);
+        return EXIT_USAGE;
+    }
+    if (!opt.output && !opt.list_mode) {
         ERR("нужен -o OUTPUT (или --list)\n");
         iso_close(&m);
         free(buf);
@@ -386,6 +459,7 @@ int main(int argc, char **argv)
 
     a = 0;
     b = m.video.sample_count - 1;
+    sel_from = 0;
 
     if (opt.exact_mode) {
         int64_t t0t, t1t;
@@ -400,9 +474,11 @@ int main(int argc, char **argv)
         }
         t0t = (int64_t)(opt.t0 * (long double)m.video.timescale + 0.5L);
         t1t = (int64_t)(opt.t1 * (long double)m.video.timescale + 0.5L);
+        sel_from = 0; /* set below on first hit */
         for (i = 0; i < m.video.sample_count; i++) {
             if (m.video.samples[i].pts >= t0t) {
                 a = i;
+                sel_from = i;
                 found = 1;
                 break;
             }
@@ -442,12 +518,21 @@ int main(int argc, char **argv)
         }
     }
 
+    raw_from = (long long)a;
     /* Snap the left edge back to a sync (IDR) sample so the cut is decodable. */
     if (iso_first_sync_at_or_before(&m.video, a, &a) != 0) {
         ERR("нет sync-сэмпла перед позицией %zu\n", a);
         iso_close(&m);
         free(buf);
         return EXIT_RANGE;
+    }
+
+    if (opt.list_mode) {
+        print_plan(&m, opt.exact_mode, raw_from, opt.have_from, sel_from,
+                   a, b);
+        iso_close(&m);
+        free(buf);
+        return EXIT_OK;
     }
 
     {
