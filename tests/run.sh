@@ -43,9 +43,11 @@ trap 'rm -rf "$WORK"' EXIT
 
 pass=0
 fail=0
+skip=0
 
 ok() { printf '[ OK ] %s\n' "$1"; pass=$((pass + 1)); }
 ko() { printf '[FAIL] %s\n' "$1"; fail=$((fail + 1)); }
+skip_note() { printf '[SKIP] %s\n' "$1"; skip=$((skip + 1)); }
 
 # check_eq NAME EXPECTED ACTUAL
 check_eq() {
@@ -110,6 +112,61 @@ check_nal_eq() {
         ok "$name"
     else
         ko "$name (NAL sequence differs: $(diff "$WORK/exp.tmp" "$WORK/got.tmp" | head -5 | tr '\n' ' '))"
+    fi
+}
+
+# --- smart-aware check wrappers (T16..T20) ---------------------------------
+# $smart is 0 when the binary was built without --smart support (see the gate
+# in the T16 block): every --smart check is then reported as SKIP instead of
+# pass/fail, so a WITH_SMART=OFF binary still ends the suite green.
+smart=1
+
+sm_eq() { # NAME EXPECTED ACTUAL
+    if [ "$smart" = 0 ]; then
+        skip_note "$1"
+    else
+        check_eq "$1" "$2" "$3"
+    fi
+}
+
+sm_rc() { # NAME EXPECTED_RC COMMAND...
+    if [ "$smart" = 0 ]; then
+        skip_note "$1"
+    else
+        check_rc "$1" "$2" "${@:3}"
+    fi
+}
+
+sm_grep() { # NAME PATTERN FILE
+    if [ "$smart" = 0 ]; then
+        skip_note "$1"
+    elif [ ! -f "$3" ]; then
+        ko "$1 (file does not exist: $3)"
+    elif grep -q "$2" "$3"; then
+        ok "$1"
+    else
+        ko "$1 (pattern not found; file: $(tr '\n' ';' <"$3" | cut -c1-160))"
+    fi
+}
+
+# first packet flag of a stream (K for a keyframe packet)
+first_pkt_flag() {
+    ffprobe -v error -select_streams v:0 -show_entries packet=flags \
+        -of csv=p=0 "$1" | head -1 | cut -c1
+}
+
+# decode verdict: clean (ffmpeg -v error, empty stderr) or dirty:<first errors>
+dec_verdict() {
+    if [ ! -f "$1" ]; then
+        echo "missing (cut failed)"
+    elif ffmpeg -v error -i "$1" -f null - 2>"$WORK/dv.err"; then
+        if [ -s "$WORK/dv.err" ]; then
+            echo "dirty: $(tr '\n' ';' <"$WORK/dv.err" | cut -c1-140)"
+        else
+            echo clean
+        fi
+    else
+        echo "dirty: rc!=0 $(tr '\n' ';' <"$WORK/dv.err" | cut -c1-140)"
     fi
 }
 
@@ -543,11 +600,248 @@ fi
 check_eq "T15 full-range cut of the truncated stream exits 0" "0" "$?"
 
 # ---------------------------------------------------------------------------
+# --smart gate. Probe a tiny cut on s3: if stderr says the binary was built
+# without smart support (WITH_SMART=OFF, e.g. no libavcodec-dev on the CI
+# runner), every T16..T20 check is counted SKIP and the suite stays green.
+# Any other probe failure leaves smart enabled so the real tests report it.
+# ---------------------------------------------------------------------------
+
+"$BIN" --smart -f 1 -o "$WORK/smart_gate.264" "$S3" 2>"$WORK/smart_gate.err"
+if grep -q "собрано без поддержки --smart" "$WORK/smart_gate.err"; then
+    smart=0
+    echo "note: binary built without --smart support, T16..T20 skipped" >&2
+fi
+
+# ---------------------------------------------------------------------------
+# T16..T20 streams (PLAN rule set for --smart). Deterministic keying via
+# scenecut=0 (pitfall 7); x264 always writes VUI timing with fixed=0
+# (pitfall 8), so --exact/--smart get their fps from the VUI.
+#   s7:  200 frames, g=40 -> IDR at dec 0,40,80,120,160 (closed GOP)
+#   s8:  same with open-gop=1 -> recovery points + leading pictures
+#   s9:  tff=1 (interlaced),  s10: cropped 318x238 — --smart v1 refusals
+# ---------------------------------------------------------------------------
+
+gen s7 -i "testsrc=size=320x240:rate=25:duration=8" \
+    -c:v libx264 -preset medium -profile:v high -pix_fmt yuv420p -g 40 \
+    -x264-params scenecut=0
+gen s8 -i "testsrc=size=320x240:rate=25:duration=8" \
+    -c:v libx264 -preset medium -profile:v high -pix_fmt yuv420p -g 40 \
+    -x264-params scenecut=0:open-gop=1
+gen s9 -i "testsrc=size=320x240:rate=25:duration=2" \
+    -c:v libx264 -preset medium -profile:v high -pix_fmt yuv420p -g 40 \
+    -x264-params scenecut=0:tff=1
+gen s10 -i "testsrc=size=320x240:rate=25:duration=2" \
+    -c:v libx264 -preset medium -profile:v high -pix_fmt yuv420p -g 40 \
+    -vf crop=318:238 -x264-params scenecut=0
+
+S7="$WORK/s7.264"
+S8="$WORK/s8.264"
+S9="$WORK/s9.264"
+S10="$WORK/s10.264"
+
+for s in s7 s8 s9 s10; do
+    "$BIN" --list "$WORK/$s.264" > "$WORK/$s.lst" \
+        || { echo "fatal: --list failed on $s" >&2; exit 2; }
+done
+
+idrs7=$(list_rows "$WORK/s7.lst" | awk '$4 == 1 {printf "%s ", $1}')
+sm_eq "T16 reference stream: 200 frames, IDR at dec 0,40,80,120,160" \
+    "0 40 80 120 160 " "$idrs7"
+
+# ---------------------------------------------------------------------------
+# T16: --smart start from the middle of a GOP (-f 50, IDR at 40 and 80):
+#      the fragment [50..79] is re-encoded (forced IDR start), [80..199]
+#      must be copied byte-for-byte.
+# ---------------------------------------------------------------------------
+
+if [ "$smart" = 1 ]; then
+    "$BIN" --smart -f 50 -o "$WORK/smart_f50.264" "$S7" 2>"$WORK/smart_f50.err"
+    rc16=$?
+    n16=$(ff_nb "$WORK/smart_f50.264")
+    k16=$(first_pkt_flag "$WORK/smart_f50.264")
+    dec16=$(dec_verdict "$WORK/smart_f50.264")
+else
+    rc16=""; n16=""; k16=""; dec16=""
+fi
+sm_eq "T16 --smart -f 50 exit code" "0" "$rc16"
+sm_eq "T16 mid-GOP smart cut decodes to 150 frames" "150" "$n16"
+sm_eq "T16 mid-GOP smart cut starts with a key frame" "K" "$k16"
+sm_eq "T16 mid-GOP smart cut decodes without stderr" "clean" "$dec16"
+
+# PSNR of the re-encoded GOP against a select-trim reference of the same
+# pictures: --list maps dec [50..79] to their display ranks; ffmpeg emits
+# frames in presentation order, so eq(n,<disp_id>) picks exactly them.
+if [ "$smart" = 1 ]; then
+    sel16=$(list_rows "$WORK/s7.lst" | awk '$1 >= 50 && $1 <= 79 {print $2}' \
+            | sort -n | awk '{printf "%s eq(n\\,%s)", (NR > 1 ? "+" : ""), $1}')
+    if ffmpeg -v error -i "$S7" -vf "select='$sel16'" -fps_mode passthrough \
+            -f rawvideo -pix_fmt yuv420p -y "$WORK/smart_ref.yuv" \
+            && ffmpeg -v error -i "$WORK/smart_f50.264" -frames:v 30 \
+            -f rawvideo -pix_fmt yuv420p -y "$WORK/smart_frag.yuv"; then
+        psnr16=$(ffmpeg -hide_banner -s 320x240 -i "$WORK/smart_frag.yuv" \
+                 -s 320x240 -i "$WORK/smart_ref.yuv" -lavfi psnr -f null - 2>&1 \
+                 | grep -oE 'average:[0-9.]+' | head -1 | cut -d: -f2)
+    else
+        psnr16=""
+    fi
+    if [ -n "$psnr16" ] && awk -v p="$psnr16" 'BEGIN { exit !(p >= 30) }'; then
+        psnr16_ok=ge30
+    else
+        psnr16_ok="${psnr16:-none}"
+    fi
+else
+    psnr16_ok=""
+fi
+sm_eq "T16 re-encoded GOP average PSNR vs source >= 30 dB" "ge30" "$psnr16_ok"
+
+# Byte-for-byte copy tail: the last N NAL signatures of the output must be
+# the source NALs of frames [80..199] (N = their count); the re-encoded head
+# and any prepended parameter sets sit before them.
+if [ "$smart" = 1 ]; then
+    lo16=$(list_rows "$WORK/s7.lst" | awk '$1 == 80 {split($9, r, "-"); print r[1]}')
+    hi16=$(list_rows "$WORK/s7.lst" | awk 'END {split($9, r, "-"); print r[2]}')
+    "$PY" "$NALPY" "$S7" | awk -v lo="$lo16" -v hi="$hi16" \
+        '$3 >= lo && $3 <= hi {print $2, $4}' > "$WORK/tail_exp.tmp"
+    nal_sigs "$WORK/smart_f50.264" > "$WORK/tail_all.tmp"
+    tail -n "$(wc -l <"$WORK/tail_exp.tmp")" "$WORK/tail_all.tmp" \
+        > "$WORK/tail_got.tmp"
+    if diff -q "$WORK/tail_exp.tmp" "$WORK/tail_got.tmp" >/dev/null; then
+        tail16=identical
+    else
+        tail16="differs: $(diff "$WORK/tail_exp.tmp" "$WORK/tail_got.tmp" | head -3 | tr '\n' ' ')"
+    fi
+else
+    tail16=""
+fi
+sm_eq "T16 copied tail NAL-exact vs source frames [80..199]" \
+    "identical" "$tail16"
+
+# ---------------------------------------------------------------------------
+# T17: boundary already on an IDR, no leading pictures (closed GOP): the
+#      --smart output must be byte-for-byte the copy-mode one (PLAN rule 5).
+# ---------------------------------------------------------------------------
+
+if [ "$smart" = 1 ]; then
+    "$BIN" --smart -f 40 -o "$WORK/smart_f40.264" "$S7" 2>/dev/null
+    rc17=$?
+    "$BIN" -f 40 -o "$WORK/copy_f40.264" "$S7" 2>/dev/null
+    if [ "$rc17" = 0 ] && cmp -s "$WORK/smart_f40.264" "$WORK/copy_f40.264"; then
+        eq17=identical
+    else
+        eq17="differs (smart rc $rc17, sizes $(stat -c %s "$WORK/smart_f40.264" 2>/dev/null) vs $(stat -c %s "$WORK/copy_f40.264" 2>/dev/null))"
+    fi
+else
+    rc17=""; eq17=""
+fi
+sm_eq "T17 --smart -f 40 (IDR boundary) exit code" "0" "$rc17"
+sm_eq "T17 --smart output byte-identical to copy output" "identical" "$eq17"
+
+# ---------------------------------------------------------------------------
+# T18: --exact --smart: display-time window 2s..5s (25 fps -> frames
+#      50..124-ish); sane frame count, key start, clean decode.
+# ---------------------------------------------------------------------------
+
+if [ "$smart" = 1 ]; then
+    "$BIN" --smart -e 00:00:02.000-00:00:05.000 -o "$WORK/smart_exact.264" \
+        "$S7" 2>"$WORK/smart_exact.err"
+    rc18=$?
+    n18=$(ff_nb "$WORK/smart_exact.264")
+    k18=$(first_pkt_flag "$WORK/smart_exact.264")
+    dec18=$(dec_verdict "$WORK/smart_exact.264")
+    if [ -n "$n18" ] && [ "$n18" -ge 70 ] && [ "$n18" -le 80 ]; then
+        n18_ok=in-range
+    else
+        n18_ok="${n18:-none}"
+    fi
+else
+    rc18=""; k18=""; dec18=""; n18_ok=""
+fi
+sm_eq "T18 --exact --smart exit code" "0" "$rc18"
+sm_eq "T18 --exact --smart frame count within 70..80" "in-range" "$n18_ok"
+sm_eq "T18 --exact --smart starts with a key frame" "K" "$k18"
+sm_eq "T18 --exact --smart decodes without stderr" "clean" "$dec18"
+
+# ---------------------------------------------------------------------------
+# T19: open GOP (s8): --smart from anchor+1 with leading pictures (L) inside
+#      the re-encode window — warm-up must repair their dependencies.  The
+#      copy mode of the same boundary only warns about them.
+# ---------------------------------------------------------------------------
+
+if [ "$smart" = 1 ]; then
+    anc19=$(list_rows "$WORK/s8.lst" | awk '$3 ~ /R/ {print $1; exit}')
+    l19=$(list_rows "$WORK/s8.lst" \
+          | awk -v a="${anc19:--1}" '$3 ~ /L/ && $1 > a + 0' | wc -l)
+    if [ -n "$anc19" ] && [ "$l19" -gt 0 ]; then
+        prem19=yes
+    else
+        prem19="no (anchor=${anc19:-none}, leading after it=$l19)"
+    fi
+else
+    anc19=""; l19=""; prem19=""
+fi
+sm_eq "T19 open-gop stream: recovery anchor with leading pictures after it" \
+    "yes" "$prem19"
+
+if [ "$smart" = 1 ] && [ -n "$anc19" ]; then
+    b19=$((anc19 + 1))
+    "$BIN" --smart -f "$b19" -o "$WORK/smart_open.264" "$S8" \
+        2>"$WORK/smart_open.err"
+    rc19=$?
+    dec19=$(dec_verdict "$WORK/smart_open.264")
+    "$BIN" -f "$b19" -o "$WORK/copy_open.264" "$S8" 2>"$WORK/copy_open.err"
+else
+    rc19=""; dec19=""
+fi
+sm_eq "T19 --smart -f (anchor+1) exit code" "0" "$rc19"
+sm_grep "T19 --smart stderr announces the re-encode window" \
+    "перекодируем" "$WORK/smart_open.err"
+sm_eq "T19 open-GOP smart cut decodes without stderr" "clean" "$dec19"
+sm_grep "T19 copy mode of the same boundary warns about leading pictures" \
+    "leading-кадров" "$WORK/copy_open.err"
+
+# ---------------------------------------------------------------------------
+# T20: --smart v1 refusals (PLAN rule 6): interlaced and cropped streams
+#      must fail with exit 2 and a literate stderr note, while copy mode of
+#      the very same boundary keeps working (the limit is smart-specific).
+# ---------------------------------------------------------------------------
+
+if [ "$smart" = 1 ]; then
+    "$BIN" --smart -f 45 -o "$WORK/smart_tff.264" "$S9" 2>"$WORK/smart_tff.err"
+    rc20t=$?
+    "$BIN" --smart -f 45 -o "$WORK/smart_crop.264" "$S10" 2>"$WORK/smart_crop.err"
+    rc20c=$?
+else
+    rc20t=""; rc20c=""
+fi
+sm_eq "T20 --smart refuses the interlaced stream (exit 2)" "2" "$rc20t"
+sm_grep "T20 interlaced refusal names frame_mbs_only_flag" \
+    "frame_mbs_only_flag = 0" "$WORK/smart_tff.err"
+sm_rc "T20 copy mode works on the interlaced stream (-f 45)" 0 \
+    "$BIN" -f 45 -o "$WORK/copy_tff.264" "$S9"
+sm_eq "T20 --smart refuses the cropped stream (exit 2)" "2" "$rc20c"
+sm_grep "T20 crop refusal names frame_cropping_flag" \
+    "frame_cropping_flag" "$WORK/smart_crop.err"
+sm_rc "T20 copy mode works on the cropped stream (-f 45)" 0 \
+    "$BIN" -f 45 -o "$WORK/copy_crop.264" "$S10"
+
+# ---------------------------------------------------------------------------
+# --smart smoke: --crf bounds and option mixing (usage errors are checked
+# unconditionally: parse-time refusals do not need smart support).
+# ---------------------------------------------------------------------------
+
+sm_rc "smoke --smart --crf 51 -f 45 succeeds" 0 \
+    "$BIN" --smart --crf 51 -f 45 -o "$WORK/smart_crf51.264" "$S7"
+check_rc "smoke --crf 52 is refused (exit 1)" 1 \
+    "$BIN" --smart --crf 52 -f 45 -o "$WORK/x.264" "$S7"
+check_rc "smoke --smart --list is refused (exit 1)" 1 \
+    "$BIN" --smart --list "$S7"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
 echo
-echo "passed: $pass, failed: $fail"
+echo "passed: $pass, skipped: $skip, failed: $fail"
 if [ "$fail" -ne 0 ]; then
     exit 1
 fi

@@ -95,6 +95,15 @@ int params_feed_nal(param_store_t *store, const uint8_t *buf, const nal_t *nal)
         st->time_scale = (uint32_t)s->vui.time_scale;
         st->num_units_in_tick = (uint32_t)s->vui.num_units_in_tick;
         st->fixed_frame_rate_flag = s->vui.fixed_frame_rate_flag;
+        st->pic_width_in_mbs_minus1 = s->pic_width_in_mbs_minus1;
+        st->pic_height_in_map_units_minus1 = s->pic_height_in_map_units_minus1;
+        st->bit_depth_luma_minus8 = s->bit_depth_luma_minus8;
+        st->bit_depth_chroma_minus8 = s->bit_depth_chroma_minus8;
+        st->frame_cropping_flag = s->frame_cropping_flag;
+        st->frame_crop_left_offset = s->frame_crop_left_offset;
+        st->frame_crop_right_offset = s->frame_crop_right_offset;
+        st->frame_crop_top_offset = s->frame_crop_top_offset;
+        st->frame_crop_bottom_offset = s->frame_crop_bottom_offset;
         /* pic_order_cnt_type == 1 (spec 7.3.2.1.1); stale values are never
          * read for other poc types, but keep the state tidy anyway. */
         if (s->pic_order_cnt_type == 1) {

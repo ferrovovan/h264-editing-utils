@@ -51,6 +51,18 @@ typedef struct {
     uint32_t time_scale;
     uint32_t num_units_in_tick;
     int fixed_frame_rate_flag;
+    /* Coded size and sample format (spec 7.3.2.1.1), consumed by --smart.
+     * Sub-high profiles carry no bit_depth syntax; h264bitstream leaves the
+     * fields zeroed there, which is the correct 8-bit inference. */
+    int pic_width_in_mbs_minus1;
+    int pic_height_in_map_units_minus1; /* in map units: double rows if !frame_mbs_only */
+    int bit_depth_luma_minus8;
+    int bit_depth_chroma_minus8;
+    int frame_cropping_flag;
+    int frame_crop_left_offset;
+    int frame_crop_right_offset;
+    int frame_crop_top_offset;
+    int frame_crop_bottom_offset;
     /* pic_order_cnt_type == 1 fields (spec 7.3.2.1.1), zeroed for other types */
     int delta_pic_order_always_zero_flag;
     int32_t offset_for_non_ref_pic;

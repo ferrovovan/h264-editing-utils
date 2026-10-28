@@ -21,6 +21,14 @@ jobs:
         with:
           submodules: recursive
 
+      # ffmpeg/ffprobe are the oracle for integration tests; the dev packages
+      # enable WITH_SMART (without them the smart tests SKIP by design).
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ffmpeg libx264-dev libavcodec-dev libavutil-dev
+
       - name: Configure
         run: cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_FLAGS="-Werror"
         env:

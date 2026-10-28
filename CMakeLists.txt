@@ -27,6 +27,8 @@ endif()
 
 add_compile_options(-Wall -Wextra)
 
+option(WITH_SMART "Поддержка --smart (нужны x264, libavcodec, libavutil)" ON)
+
 # ASAN+UBSAN for OUR targets only (vendor h264bitstream and Unity stay
 # uninstrumented). The link flags propagate transitively to every consumer
 # binary, so the sanitizer runtime is linked into h264-cut and the unit tests.

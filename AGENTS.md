@@ -70,6 +70,17 @@ bash tests/run.sh build/source/h264-cut/h264-cut   # только интегра
 11. Leading picture открытой GOP получает **отрицательный POC** через
     half-range guard type 0 — это штатно, display-бэйл по `poc < 0` делать
     нельзя (бэйлим только на parse_error).
+12. **FFmpeg (≥7), стартуя сессию с recovery point, выбрасывает leading-картинку
+    сразу за ним** («декодер выдал N-1, ожидалось N»). Тёплый прогрев транскодера
+    — всегда от ближайшего IDR, даже если usable_anchor-якорь ближе.
+13. **Нельзя резать сплайсом открытую GOP слева от recovery-хвоста:** leading
+    picture после recovery ссылаются на кадры ДО recovery, а перекодированный
+    фрагмент даёт их с другими frame_num/POC → «mmco: unref short failure».
+    Копируемый хвост обязан начинаться с чистого IDR; открытые GOP перекодируются
+    насквозь до него.
+14. `x264.h` объявляет `NAL_SLICE..NAL_FILLER` — clash с нашим `annexb.h`
+    (тот же rename-трюк, что с h264bitstream в params.c). В CMake ≥4
+    `PkgConfig::<p>` target появляется только с `IMPORTED_TARGET`.
 
 ## Тестовая дисциплина
 

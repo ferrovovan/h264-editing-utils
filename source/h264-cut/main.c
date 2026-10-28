@@ -20,7 +20,7 @@
  * along with h264-editing-utils.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-/* ftello()/off_t are POSIX; -std=c11 alone would hide them. */
+    /* ftello()/off_t are POSIX; -std=c11 alone would hide them. */
 #define _POSIX_C_SOURCE 200809L
 
 #include <stdarg.h>
@@ -30,6 +30,8 @@
 #include <string.h>
 
 #include "index.h"
+#include "params.h"
+#include "transcode.h"
 
 #define PROG "h264-cut"
 
@@ -55,6 +57,8 @@ typedef struct {
     long double t1;
     int have_fps;
     long double fps;
+    int smart_mode;
+    int crf;
     const char *output;
     const char *input;
 } opts_t;
@@ -73,13 +77,21 @@ static void usage(FILE *out)
           " порядок декодирования, включительно; по умолчанию последний)\n"
           "  -e, --exact T0-T1     диапазон по времени отображения,"
           " HH:MM:SS.mmm-HH:MM:SS.mmm (миллисекунды необязательны)\n"
-          "      --fps FPS         явный fps (десятичный); таймбаза по"
-          " умолчанию: VUI fixed-fps,\n"
-          "                        иначе SEI picture timing (clock ts, VFR"
-          " — с предупреждением)\n"
-          "  -o, --output FILE     файл результата (обязателен для"
-          " вырезания)\n"
-          "  -h, --help            эта справка\n",
+           "      --fps FPS         явный fps (десятичный); таймбаза по"
+           " умолчанию: VUI fixed-fps,\n"
+           "                        иначе SEI picture timing (clock ts, VFR"
+           " — с предупреждением)\n"
+           "      --smart           минимальное перекодирование стартового"
+           " хвоста GOP при старте\n"
+           "                        из середины GOP (вместо сдвига границы"
+           " назад на IDR; требует\n"
+           "                        известную частоту кадров: --fps или VUI"
+           " timing)\n"
+           "      --crf N           качество x264 для --smart (0..51, по"
+           " умолчанию 18)\n"
+           "  -o, --output FILE     файл результата (обязателен для"
+           " вырезания)\n"
+           "  -h, --help            эта справка\n",
           out);
 }
 
@@ -194,7 +206,8 @@ struct opt_def {
 };
 
 enum {
-    OPT_LIST, OPT_FROM, OPT_TO, OPT_EXACT, OPT_FPS, OPT_OUTPUT, OPT_HELP
+    OPT_LIST, OPT_FROM, OPT_TO, OPT_EXACT, OPT_FPS, OPT_SMART, OPT_CRF,
+    OPT_OUTPUT, OPT_HELP
 };
 
 static const struct opt_def long_opts[] = {
@@ -203,6 +216,8 @@ static const struct opt_def long_opts[] = {
     { "to-frame",   1, OPT_TO },
     { "exact",      1, OPT_EXACT },
     { "fps",        1, OPT_FPS },
+    { "smart",      0, OPT_SMART },
+    { "crf",        1, OPT_CRF },
     { "output",     1, OPT_OUTPUT },
     { "help",       0, OPT_HELP }
 };
@@ -323,6 +338,21 @@ static int parse_args(int argc, char **argv, opts_t *opt)
             opt->have_fps = 1;
             break;
         }
+        case OPT_SMART:
+            opt->smart_mode = 1;
+            opt->crf = 18;
+            break;
+        case OPT_CRF: {
+            char *end;
+            long v = strtol(val, &end, 10);
+
+            if (*val == '\0' || *end != '\0' || v < 0 || v > 51) {
+                ERR("invalid --crf value: %s (expected 0..51)\n", val);
+                return EXIT_USAGE;
+            }
+            opt->crf = (int)v;
+            break;
+        }
         case OPT_OUTPUT:
             opt->output = val;
             break;
@@ -336,8 +366,9 @@ static int parse_args(int argc, char **argv, opts_t *opt)
         return EXIT_USAGE;
     }
     if (opt->list_mode) {
-        if (opt->have_from || opt->have_to || opt->exact_mode || opt->output) {
-            ERR("--list is not compatible with -f/-t/-e/-o\n");
+        if (opt->have_from || opt->have_to || opt->exact_mode || opt->output
+                || opt->smart_mode) {
+            ERR("--list is not compatible with -f/-t/-e/-o/--smart\n");
             return EXIT_USAGE;
         }
     } else {
@@ -639,18 +670,396 @@ static int cut_bounds(const stream_index_t *idx, const opts_t *opt,
     return EXIT_OK;
 }
 
-static int do_cut(const stream_index_t *idx, const uint8_t *buf,
-                  const opts_t *opt)
+/* Smallest i > a0 usable as a cut anchor; 0 on success, -1 if none. */
+static int find_anchor_right(const stream_index_t *idx, size_t a0, size_t *out)
 {
-    size_t a0 = 0, b0 = 0, a, b, n;
-    size_t sps_at = 0, pps_at = 0;
-    int have_sps = 0, have_pps = 0, write_sps = 0, write_pps = 0;
+    size_t i;
+
+    for (i = a0 + 1; i < idx->frame_count; i++) {
+        if (idx->frames[i].usable_anchor) {
+            *out = i;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* a/b reduced by their gcd; a and b nonzero. */
+static void reduce_ratio(uint32_t a, uint32_t b, uint32_t *na, uint32_t *nb)
+{
+    uint32_t x = a, y = b, t;
+
+    while (y != 0) {
+        t = x % y;
+        x = y;
+        y = t;
+    }
+    *na = a / x;
+    *nb = b / x;
+}
+
+/* floor(x * scale) computed exactly on the integer path (values are small
+ * here: fps * 1000), %Lg long double printf for the fallback. */
+static int fps_milli(long double fps, uint32_t *out)
+{
+    long double scaled = fps * 1000.0L;
+    long long n;
+    char buf[64];
+
+    snprintf(buf, sizeof(buf), "%.9Lg", scaled);
+    if (sscanf(buf, "%lld", &n) == 1 && n > 0 && n <= 1000000000LL) {
+        /* The scaled value of any sane --fps is integer at this precision. */
+        *out = (uint32_t)n;
+        return 0;
+    }
+    return -1;
+}
+
+/*
+ * The active SPS of a frame: parameter sets are attributed to the frame they
+ * precede (trapping 5), so a set inside the frame's own AU wins, else the
+ * last SPS before its first NAL. 0 on success, -1 if no valid state.
+ */
+static int frame_sps_state(const stream_index_t *idx, size_t fr,
+                           sps_state_t *out)
+{
+    const frame_t *f = &idx->frames[fr];
+    size_t n;
+
+    for (n = f->nal_last + 1; n-- > f->nal_first;) {
+        const nal_t *nal = &idx->nals.items[n];
+        int id;
+
+        if (nal->type != NAL_SPS && nal->type != NAL_SUBSET_SPS)
+            continue;
+        if (nal->size < 2)
+            continue;
+        id = idx->buf[nal->off + 1] & 0x1f;
+        if (idx->params.sps[id].valid) {
+            *out = idx->params.sps[id];
+            return 0;
+        }
+        break;
+    }
+    {
+        size_t at = 0;
+
+        if (find_last_nal_type(idx, NAL_SPS, f->nal_first, &at) != 0)
+            return -1;
+        if (idx->nals.items[at].size < 2)
+            return -1;
+        {
+            int id = idx->buf[idx->nals.items[at].off + 1] & 0x1f;
+
+            if (!idx->params.sps[id].valid)
+                return -1;
+            *out = idx->params.sps[id];
+        }
+    }
+    return 0;
+}
+
+static int sps_limit_err(const sps_state_t *s, char *msg, size_t cap)
+{
+    if (msg[0] != '\0')
+        return 1;
+    if (!s->frame_mbs_only_flag) {
+        snprintf(msg, cap, "чересстрочный контент (frame_mbs_only_flag = 0)"
+                 " не поддерживается --smart");
+        return 1;
+    }
+    if (s->frame_cropping_flag) {
+        snprintf(msg, cap, "кадрирование кадра (frame_cropping_flag)"
+                 " не поддерживается --smart");
+        return 1;
+    }
+    if (s->bit_depth_luma_minus8 > 0 || s->bit_depth_chroma_minus8 > 0) {
+        snprintf(msg, cap, "битность больше 8 бит (luma %d, chroma %d)"
+                 " не поддерживается --smart",
+                 8 + s->bit_depth_luma_minus8, 8 + s->bit_depth_chroma_minus8);
+        return 1;
+    }
+    if (s->chroma_format_idc != 1) {
+        snprintf(msg, cap, "не 4:2:0 (chroma_format_idc = %d)"
+                 " не поддерживается --smart", s->chroma_format_idc);
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * v1 limit checks of the plan (PLAN.md rule 6) before transcoding.  The
+ * active SPS of every frame in [feed_first, enc_last] is checked (param
+ * sets are attributed to the frame they precede, so re-checking per frame
+ * follows mid-stream SPS switches); the first violation reported wins.
+ */
+static int smart_check_limits(const stream_index_t *idx,
+                              size_t feed_first, size_t enc_last)
+{
+    char msg[256];
+    size_t k;
+
+    msg[0] = '\0';
+
+    if (idx->has_fields) {
+        snprintf(msg, sizeof(msg), "чересстрочный контент (поля в потоке)"
+                 " не поддерживается --smart");
+    } else {
+        for (k = feed_first; k <= enc_last && msg[0] == '\0'; k++) {
+            sps_state_t s;
+
+            if (frame_sps_state(idx, k, &s) != 0)
+                continue; /* transcode reports a missing SPS itself */
+            sps_limit_err(&s, msg, sizeof(msg));
+        }
+    }
+    if (msg[0] == '\0') {
+        for (k = feed_first; k <= enc_last; k++) {
+            if (idx->frames[k].parse_error) {
+                snprintf(msg, sizeof(msg), "кадр %zu не разобран"
+                         " (ошибка разбора slice header) — --smart невозможен",
+                         k);
+                break;
+            }
+        }
+    }
+    if (msg[0] != '\0') {
+        ERR("%s\n", msg);
+        return EXIT_STREAM;
+    }
+    return EXIT_OK;
+}
+
+/*
+ * Append source SPS/PPS valid for frame `fr` to `out` unless its own AU
+ * already carries them (they get normalized to 4-byte start codes like
+ * everything else). Same rule as the copy mode: look inside the frame's
+ * NAL range first, then the last set before it.
+ */
+static int write_param_sets(FILE *out, const stream_index_t *idx,
+                            const uint8_t *buf, const char *outpath,
+                            size_t fr)
+{
+    size_t n, sps_at = 0, pps_at = 0;
+    int have_sps = 0, have_pps = 0;
+
+    for (n = idx->frames[fr].nal_first; n <= idx->frames[fr].nal_last; n++) {
+        if (idx->nals.items[n].type == NAL_SPS)
+            have_sps = 1;
+        else if (idx->nals.items[n].type == NAL_PPS)
+            have_pps = 1;
+    }
+    if (!have_sps) {
+        if (find_last_nal_type(idx, NAL_SPS,
+                               idx->frames[fr].nal_first, &sps_at) != 0) {
+            ERR("no SPS available\n");
+            return EXIT_STREAM;
+        }
+        if (annexb_write_nal(out, buf, &idx->nals.items[sps_at]) != 0) {
+            ERR("write error: %s\n", outpath);
+            return EXIT_IO;
+        }
+    }
+    if (!have_pps) {
+        if (find_last_nal_type(idx, NAL_PPS,
+                               idx->frames[fr].nal_first, &pps_at) != 0) {
+            ERR("no PPS available\n");
+            return EXIT_STREAM;
+        }
+        if (annexb_write_nal(out, buf, &idx->nals.items[pps_at]) != 0) {
+            ERR("write error: %s\n", outpath);
+            return EXIT_IO;
+        }
+    }
+    return EXIT_OK;
+}
+
+/* Forward: the smart planner needs the pure-copy fast path and bounds. */
+static int do_cut_copy(const stream_index_t *idx, const uint8_t *buf,
+                       const opts_t *opt, size_t a0, size_t b0);
+
+/*
+ * --smart: minimal re-encoding of the start-of-GOP tail (PLAN.md rules
+ * 1-6). copy_bounds is the already computed [a0, b0]; unlike copy mode the
+ * left boundary is NOT snapped: frames [a0 .. next_anchor-1] are
+ * re-encoded (decoder warm-up from the anchor feed_first <= a0), the rest
+ * of the range is copied byte-for-byte.
+ */
+static int do_cut_smart(const stream_index_t *idx, const uint8_t *buf,
+                        const opts_t *opt, size_t a0, size_t b0)
+{
+    size_t feed_first, next_anchor = 0, enc_first, enc_last, copy_first;
+    size_t n;
+    uint32_t fps_num = 0, fps_den = 0;
+    long double fps;
+    char terr[256];
+    uint8_t *tbuf = NULL;
+    size_t tsize = 0;
+    nal_list_t tnals;
     FILE *out;
     int rc;
 
-    rc = cut_bounds(idx, opt, &a0, &b0);
+    tnals.items = NULL;
+    tnals.count = 0;
+
+    if (find_anchor_left(idx, a0, &feed_first) != 0) {
+        ERR("no cut anchor (IDR or recovery point) at or before frame %llu\n",
+            (unsigned long long)a0);
+        return EXIT_RANGE;
+    }
+    /*
+     * A decoder session started at a recovery point drops the leading
+     * picture right after it (FFmpeg >= 7 behaviour) and that picture may
+     * reference pre-recovery content anyway: warm up from the last IDR at
+     * or before a0 when one exists (PLAN rule 4's "previous anchor").
+     */
+    if (!idx->frames[feed_first].is_idr) {
+        for (n = a0; ; n--) {
+            if (idx->frames[n].is_idr) {
+                feed_first = n;
+                break;
+            }
+            if (n == 0)
+                break;
+        }
+    }
+    if (find_anchor_right(idx, a0, &next_anchor) != 0)
+        next_anchor = idx->frame_count;
+
+    /* Rule 5: a0 is an anchor and the range holds no leading picture up to
+     * the next anchor (or the end) - re-encoding would be a lossy no-op,
+     * the output must be byte-for-byte the copy-mode one. */
+    {
+        size_t pure_last = next_anchor <= b0 ? next_anchor - 1 : b0;
+        int need_enc = !idx->frames[a0].usable_anchor;
+
+        for (n = a0; !need_enc && n <= pure_last; n++) {
+            if (idx->frames[n].leading_picture)
+                need_enc = 1;
+        }
+        if (!need_enc)
+            return do_cut_copy(idx, buf, opt, a0, b0);
+    }
+
+    enc_first = a0;
+    enc_last = (next_anchor <= b0) ? next_anchor - 1 : b0;
+    copy_first = next_anchor;
+
+    /*
+     * Open GOP: a copy tail may not start at a recovery anchor - the
+     * leading pictures after it reference pictures BEFORE that anchor,
+     * which the re-encoded fragment supplies under different frame_num/POC
+     * (a byte-copy splice breaks them). Extend the re-encode over every
+     * such GOP until the copy tail opens on a plain IDR or the range ends.
+     */
+    while (copy_first <= b0 && idx->frames[copy_first].recovery_point) {
+        size_t na;
+
+        if (find_anchor_right(idx, copy_first, &na) != 0)
+            na = idx->frame_count;
+        enc_last = (na <= b0) ? na - 1 : b0;
+        copy_first = na;
+    }
+
+    rc = smart_check_limits(idx, feed_first, enc_last);
     if (rc != EXIT_OK)
         return rc;
+
+    /* fps: --fps wins, else VUI timing (same base as --exact). */
+    if (opt->have_fps) {
+        if (fps_milli(opt->fps, &fps_num) != 0) {
+            ERR("некорректная --fps для --smart\n");
+            return EXIT_STREAM;
+        }
+        fps_den = 1000;
+        reduce_ratio(fps_num, fps_den, &fps_num, &fps_den);
+    } else if (time_base_fps(idx, &fps) == 0 && fps > 0.0L
+            && idx->num_units_in_tick > 0 && idx->time_scale > 0
+            && idx->num_units_in_tick <= 0x7FFFFFFFu) {
+        /* fps = time_scale / (2 * num_units_in_tick), exactly. */
+        reduce_ratio(idx->time_scale, 2u * idx->num_units_in_tick,
+                     &fps_num, &fps_den);
+    } else {
+        ERR("--smart требует известную частоту кадров:"
+            " укажите --fps или VUI timing\n");
+        return EXIT_STREAM;
+    }
+
+    if (idx->frames[feed_first].recovery_point) {
+        fprintf(stderr, PROG ": греется от recovery point (кадр %llu)\n",
+                (unsigned long long)feed_first);
+    }
+
+    terr[0] = '\0';
+    rc = transcode_range(buf, idx, feed_first, enc_first, enc_last, opt->crf,
+                         (uint32_t)fps_num, (uint32_t)fps_den,
+                         &tbuf, &tsize, &tnals, terr, sizeof(terr));
+    if (rc != TRANSCODE_OK) {
+        if (terr[0] != '\0')
+            ERR("%s\n", terr);
+        else
+            ERR("перекодирование не удалось\n");
+        return EXIT_STREAM;
+    }
+
+    if (copy_first <= b0) {
+        fprintf(stderr, PROG ": перекодируем кадры [%zu..%zu]"
+                " (прогрев от кадра %zu), копируем [%zu..%zu]\n",
+                enc_first, enc_last, feed_first, copy_first, b0);
+    } else {
+        fprintf(stderr, PROG ": перекодируем кадры [%zu..%zu]"
+                " (прогрев от кадра %zu)\n",
+                enc_first, enc_last, feed_first);
+    }
+
+    out = fopen(opt->output, "wb");
+    if (!out) {
+        ERR("cannot open output file: %s\n", opt->output);
+        free(tbuf);
+        annexb_list_free(&tnals);
+        return EXIT_IO;
+    }
+    for (n = 0; n < tnals.count; n++) {
+        if (annexb_write_nal(out, tbuf, &tnals.items[n]) != 0) {
+            ERR("write error: %s\n", opt->output);
+            break;
+        }
+    }
+    if (n < tnals.count) {
+        rc = EXIT_IO;
+    } else if (copy_first <= b0) {
+        rc = write_param_sets(out, idx, buf, opt->output, copy_first);
+        if (rc == EXIT_OK) {
+            size_t nf = idx->frames[copy_first].nal_first;
+            size_t nl = idx->frames[b0].nal_last;
+
+            for (n = nf; n <= nl; n++) {
+                if (annexb_write_nal(out, buf, &idx->nals.items[n]) != 0) {
+                    ERR("write error: %s\n", opt->output);
+                    rc = EXIT_IO;
+                    break;
+                }
+            }
+        }
+    }
+    if (fclose(out) != 0 && rc == EXIT_OK) {
+        ERR("write error: %s\n", opt->output);
+        rc = EXIT_IO;
+    }
+    free(tbuf);
+    annexb_list_free(&tnals);
+    return rc;
+}
+
+/* Copy mode body for the already resolved [a0, b0] (shared with --smart's
+ * pure-copy fast path). */
+static int do_cut_copy(const stream_index_t *idx, const uint8_t *buf,
+                       const opts_t *opt, size_t a0, size_t b0)
+{
+    size_t a, b, n;
+    size_t sps_at = 0, pps_at = 0;
+    int have_sps = 0, have_pps = 0, write_sps = 0, write_pps = 0;
+    FILE *out;
 
     /*
      * Snap the left boundary back to the nearest usable anchor at or
@@ -756,6 +1165,20 @@ static int do_cut(const stream_index_t *idx, const uint8_t *buf,
     return EXIT_OK;
 }
 
+static int do_cut(const stream_index_t *idx, const uint8_t *buf,
+                  const opts_t *opt)
+{
+    size_t a0 = 0, b0 = 0;
+    int rc;
+
+    rc = cut_bounds(idx, opt, &a0, &b0);
+    if (rc != EXIT_OK)
+        return rc;
+    if (opt->smart_mode)
+        return do_cut_smart(idx, buf, opt, a0, b0);
+    return do_cut_copy(idx, buf, opt, a0, b0);
+}
+
 int main(int argc, char **argv)
 {
     opts_t opt;
@@ -789,6 +1212,12 @@ int main(int argc, char **argv)
     idx_built = 1;
     if (idx.frame_count == 0) {
         ERR("no frames\n");
+        rc = EXIT_STREAM;
+        goto out;
+    }
+
+    if (opt.smart_mode && !transcode_available()) {
+        ERR("собрано без поддержки --smart (нужны x264 и libavcodec)\n");
         rc = EXIT_STREAM;
         goto out;
     }
