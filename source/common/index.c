@@ -30,9 +30,10 @@
 #define DAY_90K ((uint64_t)90000 * 24 * 3600)
 
 /*
- * SEI content parsed from the AUs seen so far, waiting for the frame it
- * belongs to (parametric NALs are attributed to the NEXT frame, so pending
- * records are attached when that frame is created).
+ * SEI content parsed from the AUs seen so far, waiting for the picture it
+ * belongs to (parametric NALs are attributed to the NEXT picture, so pending
+ * records are attached when that picture is created - or when the bottom
+ * field of an already open picture starts, which is the same picture).
  */
 typedef struct {
     int have_recovery;
@@ -113,11 +114,13 @@ static frame_t *push_frame(frame_t **frames, size_t *count, size_t *cap)
 }
 
 /*
- * Sort frame indices inside each anchor segment (segments start at an IDR
+ * Sort picture indices inside each anchor segment (segments start at an IDR
  * or at a recovery point SEI) by (poc, decoding order) and assign
  * display_index. All display indexes are set to -1 when POC is not usable
- * for every frame. Negative POCs are legitimate: leading pictures of an
- * open GOP after an IDR sort in front of their anchor.
+ * for every picture. Negative POCs are legitimate: leading pictures of an
+ * open GOP after an IDR sort in front of their anchor. A field pair is one
+ * picture (one frame_t), so 8.21 display order needs no extra handling
+ * here: the picture carries the POC of its top field.
  */
 static void compute_display(stream_index_t *idx)
 {
@@ -177,17 +180,23 @@ int index_build(stream_index_t *idx, const uint8_t *buf, size_t size)
     size_t frame_count = 0;
     size_t frame_cap = 0;
     size_t i;
+    /* State of the currently open FIELD (an access unit is one field or one
+     * frame; a field pair is two AUs but ONE picture / frame_t). */
     int have_cur = 0;
     size_t cur = 0;
     uint8_t cur_ref_idc = 0;
     uint32_t cur_frame_num = 0;
     uint32_t cur_pps_id = 0;
+    uint32_t cur_idr_pic_id = 0;
     int cur_field = 0;
     int cur_bottom = 0;
-    int have_prev_idr = 0;
-    uint32_t prev_idr_pic_id = 0;
-    long long prev_msb = 0;
-    long long prev_lsb = 0;
+    int cur_is_idr = 0;
+    int cur_have_bottom = 0;
+    /* POC type 0 state (spec 8.21.1): msb/lsb of the previous picture are
+     * tracked separately per field parity (slot = bottom_field_flag; frame
+     * pictures, incl. MBAFF, always use slot 0). */
+    long long prev_msb[2];
+    long long prev_lsb[2];
     long long prev_frame_num = 0;
     long long prev_fn_offset = 0;
     int last_sps_id = -1;
@@ -196,15 +205,19 @@ int index_build(stream_index_t *idx, const uint8_t *buf, size_t size)
     int have_anchor = 0;
     long long anchor_poc = 0;
     /*
-     * First NAL not yet attributed to any frame. Parametric NALs (SPS, PPS,
-     * SEI, AUD, filler, ...) that precede a slice join the frame that the
-     * slice starts, so a frame's NAL range is self-contained: cutting from
-     * an IDR always carries the parameter sets that belong to it.
+     * First NAL not yet attributed to any picture. Parametric NALs (SPS, PPS,
+     * SEI, AUD, filler, ...) that precede a slice join the picture that the
+     * slice starts, so a picture's NAL range is self-contained: cutting from
+     * an IDR always carries the parameter sets that belong to it. A field
+     * pair belongs to one picture, so its range spans the slices of BOTH
+     * fields (plus the parametric NALs in front of either of them).
      */
     size_t nal_start = 0;
 
     memset(idx, 0, sizeof(*idx));
     memset(&pending, 0, sizeof(pending));
+    prev_msb[0] = prev_msb[1] = 0;
+    prev_lsb[0] = prev_lsb[1] = 0;
     idx->buf = buf;
     idx->size = size;
     idx->poc_supported = 1;
@@ -222,7 +235,8 @@ int index_build(stream_index_t *idx, const uint8_t *buf, size_t size)
         size_t rbsp_size = 0;
         uint8_t *rbsp;
         slice_hdr_t hdr;
-        int new_frame;
+        int same_field;
+        int new_pic;
         const pps_state_t *pps;
         const sps_state_t *sps;
         long long poc = -1;
@@ -255,8 +269,8 @@ int index_build(stream_index_t *idx, const uint8_t *buf, size_t size)
                 } else if (id < 32) {
                     if ((int)id != last_sps_id) {
                         last_sps_id = (int)id;
-                        prev_msb = 0;
-                        prev_lsb = 0;
+                        prev_msb[0] = prev_msb[1] = 0;
+                        prev_lsb[0] = prev_lsb[1] = 0;
                         prev_frame_num = 0;
                         prev_fn_offset = 0;
                     }
@@ -327,7 +341,10 @@ int index_build(stream_index_t *idx, const uint8_t *buf, size_t size)
         }
 
         if (!rbsp) {
-            /* Unparsable slice NAL: its own frame, next slice starts fresh. */
+            /* Unparsable slice NAL: its own picture, next slice starts
+             * fresh. Parity POC state is unknown from here on, so both POC
+             * tracking states are left as they are (the picture is marked
+             * parse_error and display order is dropped wholesale). */
             f = push_frame(&frames, &frame_count, &frame_cap);
             if (!f) {
                 goto fail;
@@ -347,20 +364,50 @@ int index_build(stream_index_t *idx, const uint8_t *buf, size_t size)
         }
         free(rbsp);
 
-        if (!have_cur) {
-            new_frame = 1;
-        } else if (nal->type == NAL_IDR) {
-            new_frame = !have_prev_idr || hdr.idr_pic_id != prev_idr_pic_id;
-        } else {
-            new_frame = hdr.first_mb_in_slice == 0 ||
-                        hdr.frame_num != cur_frame_num ||
-                        hdr.field_pic_flag != cur_field ||
-                        hdr.bottom_field_flag != cur_bottom ||
-                        nal->ref_idc != cur_ref_idc ||
-                        hdr.pps_id != cur_pps_id;
+        /*
+         * AU boundaries (spec 7.4.1.2.4). same_field: another slice of the
+         * currently open field (an IDR AU is recognised by its idr_pic_id;
+         * a frame AU by the frame_num/pps/ref/field-tuple with a non-zero
+         * first_mb_in_slice). Otherwise the slice opens a new field, which
+         * however CONTINUES the current picture when it is the bottom field
+         * of a field pair (spec 8.21.1: a field pair is one picture, one
+         * unit of display and of cutting): bottom, current field is the top
+         * one, frame_num / pps_id / nal_ref_idc match and the picture has no
+         * bottom field yet. IDR field pairs pair by the very same rule (both
+         * NALs are type 5 with the same idr_pic_id - the second one must not
+         * open a new IDR segment). An orphan top field (stream cut before
+         * its bottom) is a picture of its own, which is fine.
+         */
+        same_field = 0;
+        new_pic = 1;
+        if (have_cur) {
+            if (nal->type == NAL_IDR) {
+                same_field = cur_is_idr &&
+                             hdr.idr_pic_id == cur_idr_pic_id &&
+                             hdr.field_pic_flag == cur_field &&
+                             hdr.bottom_field_flag == cur_bottom;
+            } else if (!cur_is_idr) {
+                same_field = hdr.first_mb_in_slice != 0 &&
+                             hdr.frame_num == cur_frame_num &&
+                             hdr.field_pic_flag == cur_field &&
+                             hdr.bottom_field_flag == cur_bottom &&
+                             nal->ref_idc == cur_ref_idc &&
+                             hdr.pps_id == cur_pps_id;
+            }
+            if (same_field) {
+                new_pic = 0;
+            } else if (hdr.field_pic_flag && hdr.bottom_field_flag &&
+                       cur_field && !cur_bottom && !cur_have_bottom &&
+                       hdr.frame_num == cur_frame_num &&
+                       hdr.pps_id == cur_pps_id &&
+                       nal->ref_idc == cur_ref_idc &&
+                       (nal->type == NAL_IDR) == cur_is_idr &&
+                       (!cur_is_idr || hdr.idr_pic_id == cur_idr_pic_id)) {
+                new_pic = 0;
+            }
         }
 
-        if (new_frame) {
+        if (new_pic) {
             f = push_frame(&frames, &frame_count, &frame_cap);
             if (!f) {
                 goto fail;
@@ -373,59 +420,87 @@ int index_build(stream_index_t *idx, const uint8_t *buf, size_t size)
             f->frame_num = hdr.frame_num;
             f->usable_anchor = (nal->type == NAL_IDR);
             attach_sei_pending(f, &pending);
-
-            have_cur = 1;
-            cur_ref_idc = nal->ref_idc;
-            cur_frame_num = hdr.frame_num;
-            cur_pps_id = hdr.pps_id;
-            cur_field = hdr.field_pic_flag;
-            cur_bottom = hdr.bottom_field_flag;
+            cur_have_bottom = hdr.field_pic_flag && hdr.bottom_field_flag;
         } else {
             frames[cur].nal_last = i;
             f = &frames[cur];
+            if (!same_field) {
+                /* The bottom field of this picture: its own AU boundary can
+                 * carry SEI/parametric NALs (they join the picture's NAL
+                 * range below), so attach anything pending to this picture. */
+                cur_have_bottom = 1;
+                attach_sei_pending(f, &pending);
+            }
         }
         nal_start = i + 1;
 
         if (hdr.field_pic_flag) {
             idx->has_fields = 1;
         }
-        if (nal->type == NAL_IDR) {
-            have_prev_idr = 1;
-            prev_idr_pic_id = hdr.idr_pic_id;
-        }
 
-        if (new_frame) {
+        cur_ref_idc = nal->ref_idc;
+        cur_frame_num = hdr.frame_num;
+        cur_pps_id = hdr.pps_id;
+        cur_idr_pic_id = hdr.idr_pic_id;
+        cur_field = hdr.field_pic_flag;
+        cur_bottom = hdr.bottom_field_flag;
+        cur_is_idr = (nal->type == NAL_IDR);
+        have_cur = 1;
+
+        /* POC state advances once per field (access unit), but only the
+         * first field of a picture (its top field, or the surviving field of
+         * a broken pair) writes frame_t.poc: a picture is identified by the
+         * TopFieldOrderCnt of spec 8.21.1. */
+        if (!same_field) {
             pps = &idx->params.pps[hdr.pps_id];
             sps = &idx->params.sps[pps->sps_id];
             if (sps->pic_order_cnt_type == 0) {
-                /* spec 8.2.1 (pic_order_cnt_type == 0), as implemented by
-                 * FFmpeg ff_h264_init_poc: the msb moves only on a wrap of
-                 * at least half the lsb range, which is what keeps B-frame
-                 * decode order (6,2,4,12,...) on a monotonic POC. */
+                /* spec 8.2.1 + 8.21.1 (pic_order_cnt_type == 0), as
+                 * implemented by FFmpeg ff_h264_init_poc: the msb moves only
+                 * on a wrap of at least half the lsb range, which is what
+                 * keeps B-frame decode order (6,2,4,12,...) on a monotonic
+                 * POC. With fields the whole wrap rule runs independently on
+                 * each field parity (8.21.1 keeps a separate
+                 * prevPicOrderCnt{Msb,Lsb} per field type); IDR resets both
+                 * slots. Progressive streams only ever touch slot 0, so this
+                 * is bit-for-bit the old behaviour there.
+                 * Simplification (documented, B7): for a bottom field of a
+                 * field pair 8.21.1 additionally takes the msb from its own
+                 * top field instead of the parity wrap rule. We do not store
+                 * bottom POCs at all (a picture is its TopFieldOrderCnt), so
+                 * that clause can only shift the bottom parity slot, which
+                 * afterwards is read by orphan bottom fields only. */
                 long long max_lsb = sps->max_poc_lsb;
                 long long lsb = (long long)hdr.poc_lsb;
+                int parity = hdr.bottom_field_flag ? 1 : 0;
                 long long msb;
                 if (nal->type == NAL_IDR) {
                     msb = 0;
-                } else if (lsb < prev_lsb && prev_lsb - lsb >= max_lsb / 2) {
-                    msb = prev_msb + max_lsb;
-                } else if (lsb > prev_lsb && lsb - prev_lsb > max_lsb / 2) {
-                    msb = prev_msb - max_lsb;
+                } else if (lsb < prev_lsb[parity] &&
+                           prev_lsb[parity] - lsb >= max_lsb / 2) {
+                    msb = prev_msb[parity] + max_lsb;
+                } else if (lsb > prev_lsb[parity] &&
+                           lsb - prev_lsb[parity] > max_lsb / 2) {
+                    msb = prev_msb[parity] - max_lsb;
                 } else {
-                    msb = prev_msb;
+                    msb = prev_msb[parity];
                 }
                 poc = msb + lsb;
-                prev_msb = msb;
-                prev_lsb = lsb;
+                prev_msb[parity] = msb;
+                prev_lsb[parity] = lsb;
                 if (nal->type == NAL_IDR) {
-                    prev_msb = 0;
-                    prev_lsb = 0;
+                    prev_msb[0] = prev_msb[1] = 0;
+                    prev_lsb[0] = prev_lsb[1] = 0;
                 }
             } else if (sps->pic_order_cnt_type == 2) {
-                /* spec 8.2.1 (pic_order_cnt_type == 2):
-                 * PicOrderCnt = 2 * FrameNumOffset - (nal_ref_idc == 0 ? 1 : 0),
-                 * FrameNumOffset unwrapping the modular frame_num at each
-                 * wrap and at IDR. */
+                /* spec 8.2.1 (pic_order_cnt_type == 2) + 8.21.1: with fields
+                 * PicOrderCnt = 2 * FrameNumOffset - (nal_ref_idc == 0 ? 1
+                 * : 0) is the TopFieldOrderCnt of the pair (8.21.1 adds +1
+                 * for the bottom field, which a picture does not store); the
+                 * two fields carry the same frame_num and nal_ref_idc, so
+                 * running this per field is idempotent for the pair.
+                 * FrameNumOffset unwraps the modular frame_num at each wrap
+                 * and at IDR. */
                 long long fn = (long long)hdr.frame_num;
                 long long fn_offset;
                 if (nal->type == NAL_IDR) {
@@ -440,14 +515,23 @@ int index_build(stream_index_t *idx, const uint8_t *buf, size_t size)
                 prev_fn_offset = fn_offset;
                 prev_frame_num = fn;
             } else if (sps->pic_order_cnt_type == 1) {
-                /* spec 8.2.1.2 (8.2.1.1 in the 2003 edition), cross-checked
-                 * against FFmpeg ff_h264_init_poc. Progressive frames only:
-                 * interlaced branches and the mmco-5 FrameNumOffset reset are
-                 * out of scope (B7). POC type 1 carries no PicOrderCntMsb/
-                 * PicOrderCntLsb state: the POC is derived absolutely from the
-                 * unwrapped FrameNumOffset (8-6), which plays the role of the
-                 * msb; a picture unreferenced via dec_ref_pic_marking keeps
-                 * the POC of its nal_ref_idc (8-9 uses nal_ref_idc only). */
+                /* spec 8.2.1.2 (8.2.1.1 in the 2003 edition) + 8.21.1,
+                 * cross-checked against FFmpeg ff_h264_init_poc. The POC of
+                 * the picture is the TopFieldOrderCnt: equations 8-23..8-26
+                 * run on the frame_num / nal_ref_idc / delta_pic_order_cnt[0]
+                 * of the field pair, which both fields carry identically (the
+                 * deep slice path reads delta_pic_order_cnt[1] only for
+                 * frames, per 7.3.3), so computing this once per field is
+                 * idempotent and no POC1 state is needed for interlacing.
+                 * offset_for_top_to_bottom_field affects the BottomField-
+                 * OrderCnt (top + 1 + offset) exclusively, so it cannot
+                 * change a picture POC and stays unused here. The mmco-5
+                 * FrameNumOffset reset is out of scope. POC type 1 carries no
+                 * PicOrderCntMsb/PicOrderCntLsb state: the POC is derived
+                 * absolutely from the unwrapped FrameNumOffset (8-6), which
+                 * plays the role of the msb; a picture unreferenced via
+                 * dec_ref_pic_marking keeps the POC of its nal_ref_idc (8-9
+                 * uses nal_ref_idc only). */
                 long long fn = (long long)hdr.frame_num;
                 long long fn_offset = prev_fn_offset;
                 long long abs_fn, expected = 0;
@@ -487,6 +571,8 @@ int index_build(stream_index_t *idx, const uint8_t *buf, size_t size)
                 idx->poc_supported = 0;
                 poc = -1;
             }
+        }
+        if (new_pic) {
             f->poc = poc;
 
             /*
@@ -494,8 +580,8 @@ int index_build(stream_index_t *idx, const uint8_t *buf, size_t size)
              * an anchor (IDR or recovery point) whose POC is below the
              * anchor's - it decodes with references from before the anchor,
              * so a cut starting at the anchor carries it with broken
-             * dependencies. The check uses the anchor before this frame;
-             * then this frame becomes the new anchor if it is one.
+             * dependencies. The check uses the anchor before this picture;
+             * then this picture becomes the new anchor if it is one.
              */
             if (!f->is_idr && nal->ref_idc == 0 && have_anchor &&
                     idx->poc_supported && poc < anchor_poc) {

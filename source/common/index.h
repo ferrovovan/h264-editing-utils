@@ -28,15 +28,22 @@
 #include "annexb.h"
 #include "params.h"
 
-/* One picture (frame), in decoding order. */
+/*
+ * One picture in decoding order: a progressive/MBAFF frame, or a field pair
+ * (top + bottom field, spec 8.21) — a field pair is ONE picture, the unit of
+ * display order and of cutting. An orphan field (the other half of the pair
+ * is missing, e.g. a truncated stream) is a picture of its own.
+ */
 typedef struct {
-    size_t nal_first, nal_last;  /* inclusive range of NALs belonging to this frame */
+    size_t nal_first, nal_last;  /* inclusive NAL range (both fields of a pair) */
     int is_idr;
     char pic_type;               /* 'I','P','B','S','X' or '?' if unparsable */
     uint32_t frame_num;
-    long long poc;               /* PicOrderCnt, reset at every IDR; -1 if unknown */
+    long long poc;               /* PicOrderCnt of the picture: the TopFieldOrderCnt
+                                  * of a field pair (8.21.1), reset at every IDR;
+                                  * -1 if unknown */
     long long display_index;     /* position in display order; -1 if unknown */
-    int parse_error;             /* slice header parse failed for this frame */
+    int parse_error;             /* slice header parse failed for this picture */
     /* Open GOP (recovery point SEI, spec D.1.7): */
     int recovery_point;          /* AU carries a recovery_point SEI */
     uint32_t recovery_frame_cnt;
@@ -58,27 +65,33 @@ typedef struct {
     size_t size;
     nal_list_t nals;
     param_store_t params;        /* final parameter set state after the scan */
-    frame_t *frames;
-    size_t frame_count;
+    frame_t *frames;             /* pictures, in decoding order */
+    size_t frame_count;          /* picture count (a field pair counts once) */
     int poc_supported;           /* 0 if an unknown pic_order_cnt_type was seen */
-    int has_fields;              /* interlaced content seen (fields counted as frames) */
+    int has_fields;              /* field_pic_flag seen (a field pair is still one
+                                  * picture; --smart refuses such streams) */
     int timing_valid;            /* first parsed SPS carried VUI timing */
     uint32_t time_scale;
     uint32_t num_units_in_tick;
     int fixed_frame_rate;
-    int clock_timing;            /* frame_count > 0 and every frame has_clock_ts */
+    int clock_timing;            /* frame_count > 0 and every picture has_clock_ts */
 } stream_index_t;
 
 /*
- * Scan the stream, group slices into frames, compute POC and display order.
- * Slices are grouped into the current frame unless (spec 7.4.1.2.4):
- *   - the NAL is an IDR whose idr_pic_id differs from the previous IDR, or
+ * Scan the stream, group slices into pictures, compute POC and display order.
+ * Slices are grouped into the current field unless (spec 7.4.1.2.4):
+ *   - the NAL is an IDR whose idr_pic_id differs from the current IDR field, or
  *   - first_mb_in_slice == 0, or
  *   - frame_num / field flags / nal_ref_idc / pps_id differ from the current
- *     frame, or the NAL is type 5.
- * display_index is computed per IDR segment (closed-GOP assumption) by
- * sorting on (poc, decoding order). Unparsable slice NALs form their own
- * frame with pic_type '?', parse_error = 1.
+ *     field, or the NAL is type 5.
+ * A bottom field whose top field is the current one (same frame_num / pps_id /
+ * nal_ref_idc / field_pic_flag, picture without a bottom field yet; IDR pairs
+ * by the same rule through the shared idr_pic_id) continues the SAME picture
+ * (8.21.1), so a field pair is one frame_t whose NAL range spans both fields.
+ * POC type 0 keeps its wrap state per field parity (8.21.1), the picture POC
+ * is the top field's. display_index is computed per IDR segment (closed-GOP
+ * assumption) by sorting on (poc, decoding order). Unparsable slice NALs form
+ * their own picture with pic_type '?', parse_error = 1.
  * Returns 0 on success (even for partially unparsable streams), -1 on
  * allocation failure.
  */

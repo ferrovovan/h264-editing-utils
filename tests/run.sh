@@ -825,6 +825,73 @@ sm_rc "T20 copy mode works on the cropped stream (-f 45)" 0 \
     "$BIN" -f 45 -o "$WORK/copy_crop.264" "$S10"
 
 # ---------------------------------------------------------------------------
+# T21: interlaced MBAFF stream (x264 tff=1): the index must group coded
+#      pictures correctly. x264 writes MBAFF only - whole-frame pictures with
+#      frame_mbs_only_flag = 0 (mb_adaptive_frame_field_flag = 1), it never
+#      emits PAFF field-coded pictures, so the field-pair grouping of 8.21.1
+#      itself is covered by unit tests (test_interlace.c) the same way POC
+#      type 1 is; here we check the MBAFF 1:1 regression against ffprobe.
+#      rate=50 + tff=1: x264 codes 50 MBAFF frames per second (50 x 4 = 200
+#      coded frames, the bitstream flagged top-field-first), so --list must
+#      print exactly one row per coded frame.
+# ---------------------------------------------------------------------------
+
+gen s11 -i "testsrc=size=320x240:rate=50:duration=4" \
+    -c:v libx264 -preset ultrafast -profile:v high -pix_fmt yuv420p -g 30 \
+    -x264-params "tff=1:scenecut=0"
+
+S11="$WORK/s11.264"
+"$BIN" --list "$S11" > "$WORK/s11.lst" \
+    || { echo "fatal: --list failed on s11" >&2; exit 2; }
+
+# Premise: the stream really is interlaced on the SPS level (ffprobe reports
+# a top field order, which requires frame_mbs_only_flag = 0).
+fo21=$(ffprobe -v error -select_streams v:0 -show_entries stream=field_order \
+       -of default=nw=1:nk=1 "$S11")
+check_eq "T21 MBAFF stream is interlaced per ffprobe (frame_mbs_only_flag = 0)" \
+    "tt" "$fo21"
+
+n_list21=$(list_rows "$WORK/s11.lst" | wc -l)
+n_ff21=$(ff_nb "$S11")
+check_eq "T21 MBAFF picture count --list (50 fps x 4 s)" "200" "$n_list21"
+check_eq "T21 MBAFF picture count --list equals ffprobe nb_read_frames" \
+    "$n_ff21" "$n_list21"
+
+# IDR/dec order vs the container's key-frame packets (dec indexes).
+idr_dec21=$(list_rows "$WORK/s11.lst" | awk '$4 == 1 {printf "%s ", $1}')
+idr_pkt21=$(ffprobe -v error -select_streams v:0 -show_entries packet=flags \
+           -of csv=p=0 "$S11" | awk 'substr($0, 1, 1) == "K" {printf "%d ", NR - 1}')
+check_eq "T21 MBAFF IDR decode indexes match ffprobe key packets" \
+    "$idr_pkt21" "$idr_dec21"
+
+if "$BIN" -f 30 -o "$WORK/cut_mbaff.264" "$S11" 2>"$WORK/cut_mbaff.err"; then
+    rc21=0
+else
+    rc21=$?
+fi
+check_eq "T21 copy cut -f 30 of the MBAFF stream exits 0" "0" "$rc21"
+check_eq "T21 MBAFF copy cut decodes without stderr" "clean" \
+    "$(dec_verdict "$WORK/cut_mbaff.264")"
+
+# ---------------------------------------------------------------------------
+# T22: --smart refusal on the MBAFF stream must stay exactly as in T20
+#      (interlaced limit is smart-specific; the copy mode of T21 works).
+# ---------------------------------------------------------------------------
+
+# Mid-GOP boundary on purpose (-f 30 would be the pure-copy shortcut of rule
+# 5, which never reaches the limit checks).
+if [ "$smart" = 1 ]; then
+    "$BIN" --smart -f 10 -o "$WORK/smart_mbaff.264" "$S11" \
+        2>"$WORK/smart_mbaff.err"
+    rc22=$?
+else
+    rc22=""
+fi
+sm_eq "T22 --smart refuses the MBAFF stream (exit 2)" "2" "$rc22"
+sm_grep "T22 MBAFF refusal keeps the frame_mbs_only_flag text" \
+    "frame_mbs_only_flag = 0" "$WORK/smart_mbaff.err"
+
+# ---------------------------------------------------------------------------
 # --smart smoke: --crf bounds and option mixing (usage errors are checked
 # unconditionally: parse-time refusals do not need smart support).
 # ---------------------------------------------------------------------------
