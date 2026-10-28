@@ -126,9 +126,25 @@
 `-DWITH_SMART=OFF`, и с санитайзерами); правила 1–5 покрыты тестами;
 README/HISTORY обновлены.
 
-## Дальше (без сроков)
+## Финальный заход — v1.0
 
-- **B7.** Интерлейс: поле-пары, POC, ограничения.
-- **C.** Контейнеры: ISO-BMFF-читалка (box, avcC, stts/stss/stsc/stco) →
-  `mp4-cut` (таймстемпы честные, дорожки копируются); затем Matroska/EBML.
-- **D.** Мелочи: `avcc2annexb`/`annexb2avcc`, `--list` машинночитаемый вывод.
+- [ ] **D1.** `common/avcc.{h,c}`: avcC (ISO/IEC 14496-15) parse/build +
+      конвейер AVCC↔Annex B; бинари `avcc2annexb`/`annexb2avcc`; unit-тесты
+      (golden avcC) + интеграция (round-trip, сверка nal_seq).
+- [ ] **D2.** `--list --json` (машинночитаемый вывод, test: json.load).
+- [ ] **B7.** Интерлейс: PAFF поле-пары → картинки, display-порядок 8.21,
+      вырезка copy-режима целыми картинками; MBAFF = штатные кадры;
+      `--smart` интерлейс по-прежнему отказывает (documented).
+- [ ] **C.** `common/iso.{h,c}`: обход боксов, avcC, stts/ctts/stss/stsc/
+      stsz/stco/co64 → `mp4-cut` v1: одно видео-трек, границы `-f/-t/--exact`,
+      пересборка stbl, байтовая идентичность сэмплов, ffprobe-оракул.
+- [ ] **R4.** Правый край `--smart --exact`: trailing-картины открытой GOP,
+      чьё отображение в диапазоне, а декодирование за `to` — попадают в
+      перекодируемое окно (feed_last за `to`).
+- [ ] **CI.** Fresh-clone job (`clone --recursive` + сборка + ctest);
+      релизные артефакты на тегах (бинарь + CHANGELOG из HISTORY).
+- [ ] **v1.0.0**: README (полная картина), HISTORY, тег.
+
+Приёмка: ctest зелёный во всех конфигурациях (обычная, `-Werror`,
+`WITH_SMART=OFF`, санитайзеры); новые ограничения — чистые отказы кодом 2
+с русскими текстами.
