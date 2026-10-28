@@ -446,11 +446,6 @@ int transcode_range(const uint8_t *buf, const stream_index_t *idx,
         ret = TRANSCODE_UNSUPPORTED;
         goto fail;
     }
-    if (st.frame_cropping_flag) {
-        t_err(err, errcap, "обрезка кадра (frame_cropping_flag) не поддерживается (--smart)");
-        ret = TRANSCODE_UNSUPPORTED;
-        goto fail;
-    }
     if (st.bit_depth_luma_minus8 > 0 || st.bit_depth_chroma_minus8 > 0) {
         t_err(err, errcap, "битность больше 8 (%d+%d) не поддерживается (--smart)",
               8 + st.bit_depth_luma_minus8, 8 + st.bit_depth_chroma_minus8);
@@ -465,6 +460,25 @@ int transcode_range(const uint8_t *buf, const stream_index_t *idx,
     width = (st.pic_width_in_mbs_minus1 + 1) * 16;
     height = (st.pic_height_in_map_units_minus1 + 1) * 16 *
              (2 - st.frame_mbs_only_flag);
+    if (st.frame_cropping_flag) {
+        /*
+         * The decoder emits the CROPPED picture (display size), so x264 is
+         * fed display dimensions and pads/crops internally to the macroblock
+         * grid itself - geometry of the output equals the source. 4:2:0 was
+         * enforced above: crop offsets count 2x2 chroma samples.
+         */
+        width  -= 2 * (st.frame_crop_left_offset + st.frame_crop_right_offset);
+        height -= 2 * (st.frame_crop_top_offset + st.frame_crop_bottom_offset);
+        if (width <= 0 || height <= 0) {
+            t_err(err, errcap,
+                  "кроп оставляет пустой кадр (%d+%d, %d+%d при кадре %dx%d)",
+                  st.frame_crop_left_offset, st.frame_crop_right_offset,
+                  st.frame_crop_top_offset, st.frame_crop_bottom_offset,
+                  (st.pic_width_in_mbs_minus1 + 1) * 16,
+                  (st.pic_height_in_map_units_minus1 + 1) * 16);
+            goto fail;
+        }
+    }
     if (width <= 0 || height <= 0 || width > INT_MAX / 2 || height > INT_MAX / 2) {
         t_err(err, errcap, "недопустимый размер кадра %dx%d", width, height);
         goto fail;
@@ -480,6 +494,10 @@ int transcode_range(const uint8_t *buf, const stream_index_t *idx,
     xp.i_fps_num = fps_num;
     xp.i_fps_den = fps_den;
     xp.i_scenecut_threshold = 0;
+    /* Cut fragments start with a forced IDR: open-GOP leading pictures
+     * would carry negative POC/pts and get clipped by mp4 edit lists in
+     * downstream remuxes. Emit closed GOPs. */
+    xp.b_open_gop = 0;
     xp.i_threads = 1;
     xp.rc.i_lookahead = 0;
     xp.b_repeat_headers = 1;

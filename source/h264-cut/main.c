@@ -854,11 +854,6 @@ static int sps_limit_err(const sps_state_t *s, char *msg, size_t cap)
                  " не поддерживается --smart");
         return 1;
     }
-    if (s->frame_cropping_flag) {
-        snprintf(msg, cap, "кадрирование кадра (frame_cropping_flag)"
-                 " не поддерживается --smart");
-        return 1;
-    }
     if (s->bit_depth_luma_minus8 > 0 || s->bit_depth_chroma_minus8 > 0) {
         snprintf(msg, cap, "битность больше 8 бит (luma %d, chroma %d)"
                  " не поддерживается --smart",

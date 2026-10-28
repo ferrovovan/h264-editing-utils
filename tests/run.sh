@@ -800,9 +800,10 @@ sm_grep "T19 copy mode of the same boundary warns about leading pictures" \
     "leading-кадров" "$WORK/copy_open.err"
 
 # ---------------------------------------------------------------------------
-# T20: --smart v1 refusals (PLAN rule 6): interlaced and cropped streams
-#      must fail with exit 2 and a literate stderr note, while copy mode of
-#      the very same boundary keeps working (the limit is smart-specific).
+# T20: --smart limit checks (PLAN rule 6): the interlaced stream must fail
+#      with exit 2 and a literate stderr note while copy mode of the very
+#      same boundary keeps working; cropped streams are TRANSCODED with the
+#      display geometry preserved (x264 re-emits an equivalent crop).
 # ---------------------------------------------------------------------------
 
 if [ "$smart" = 1 ]; then
@@ -818,9 +819,15 @@ sm_grep "T20 interlaced refusal names frame_mbs_only_flag" \
     "frame_mbs_only_flag = 0" "$WORK/smart_tff.err"
 sm_rc "T20 copy mode works on the interlaced stream (-f 45)" 0 \
     "$BIN" -f 45 -o "$WORK/copy_tff.264" "$S9"
-sm_eq "T20 --smart refuses the cropped stream (exit 2)" "2" "$rc20c"
-sm_grep "T20 crop refusal names frame_cropping_flag" \
-    "frame_cropping_flag" "$WORK/smart_crop.err"
+# Cropped streams are TRANSCODED (not refused): x264 is fed the display
+# size, writes its own matching crop, geometry must survive the cut.
+sm_eq "T20 --smart accepts the cropped stream (exit 0)" "0" "$rc20c"
+sm_eq "T20 cropped --smart keeps the display size 318x238" "318x238" \
+    "$(ffprobe -v error -select_streams v:0 \
+        -show_entries stream=width,height -of csv=p=0:s=x \
+        "$WORK/smart_crop.264" 2>/dev/null)"
+sm_eq "T20 cropped --smart output decodes without stderr" "clean" \
+    "$(dec_verdict "$WORK/smart_crop.264")"
 sm_rc "T20 copy mode works on the cropped stream (-f 45)" 0 \
     "$BIN" -f 45 -o "$WORK/copy_crop.264" "$S10"
 
