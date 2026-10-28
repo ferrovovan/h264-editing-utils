@@ -160,8 +160,19 @@ v1.0.0. ctest: 12 тестов; интеграционных проверок �
   `cut_bounds_ex` — план не может разойтись с фактом (T35 сверяет цифры).
   Зеркальный план в `mp4-cut`. Интеграционных проверок: 160.
 
+## 2026-10-28 — релиз v1.1 (первый стабильный)
+
+Единый релизный тег **v1.1**: черновые локальные теги `v0.2` и `v1.0.0`
+удалены (на remote их не было), номер v1.0 не используется — v1.1 и есть
+первый стабильный релиз. Состав: `h264-cut` (copy/`--exact`/`--smart`/план),
+`mp4-cut`, `avcc2annexb`/`annexb2avcc`, common-ядро (bits/annexb/params/
+index/sei/avcc/iso/transcode). Приёмка: ctest 11/11, интеграция 160/160
+(ASAN/UBSAN/LSan в сборке), `-Werror` ноль warning'ов, `WITH_SMART=OFF`,
+shellcheck, `clone --recursive` с нуля; `release` job на теге собирает
+бинари + CHANGELOG.
+
 ## Дальше
 
-Matroska/EBML поверх готового ядра; правый край `--smart` (trailing открытой
-GOP, `PLAN.md` R4 — осознанный перенос); libFuzzer-таргеты, кросс-сборки
-musl/mingw — в `TODO.md`.
+Matroska/EBML поверх готового ядра; tty-эстетика (`TODO.md` M3); libFuzzer-
+таргеты, кросс-сборки musl/mingw, корпус на реальных потоках — в `TODO.md`.
+Правый край `--smart` (R4) закрыт ревью в v1.1 — недоборов нет.
