@@ -48,6 +48,7 @@ enum {
 
 typedef struct {
     int list_mode;
+    int json_mode;
     int exact_mode;
     int have_from;
     int have_to;
@@ -71,6 +72,11 @@ static void usage(FILE *out)
           "                        колонка t — display-время (сек),"
           " суффиксы типа: L — leading\n"
           "                        picture открытой GOP, R — recovery point\n"
+          "      --json            только вместе с --list:"
+          " машинночитаемый JSON-объект\n"
+          "                        в stdout (текста на русском в"
+          " stdout нет); отдельно или с\n"
+          "                        вырезанием — ошибка, код 1\n"
           "  -f, --from-frame N    первый сохраняемый кадр (0-based,"
           " порядок декодирования, включительно)\n"
           "  -t, --to-frame M      последний сохраняемый кадр (0-based,"
@@ -206,12 +212,13 @@ struct opt_def {
 };
 
 enum {
-    OPT_LIST, OPT_FROM, OPT_TO, OPT_EXACT, OPT_FPS, OPT_SMART, OPT_CRF,
-    OPT_OUTPUT, OPT_HELP
+    OPT_LIST, OPT_JSON, OPT_FROM, OPT_TO, OPT_EXACT, OPT_FPS, OPT_SMART,
+    OPT_CRF, OPT_OUTPUT, OPT_HELP
 };
 
 static const struct opt_def long_opts[] = {
     { "list",       0, OPT_LIST },
+    { "json",       0, OPT_JSON },
     { "from-frame", 1, OPT_FROM },
     { "to-frame",   1, OPT_TO },
     { "exact",      1, OPT_EXACT },
@@ -304,6 +311,9 @@ static int parse_args(int argc, char **argv, opts_t *opt)
         case OPT_LIST:
             opt->list_mode = 1;
             break;
+        case OPT_JSON:
+            opt->json_mode = 1;
+            break;
         case OPT_FROM:
             if (parse_index_val(val, &opt->from) != 0) {
                 ERR("invalid --from-frame value: %s\n", val);
@@ -363,6 +373,11 @@ static int parse_args(int argc, char **argv, opts_t *opt)
 
     if (!opt->input) {
         ERR("no input file specified\n");
+        return EXIT_USAGE;
+    }
+    if (opt->json_mode && !opt->list_mode) {
+        ERR("--json используется только вместе с --list"
+            " (при вырезании JSON недоступен)\n");
         return EXIT_USAGE;
     }
     if (opt->list_mode) {
@@ -491,6 +506,77 @@ static int do_list(const stream_index_t *idx)
                i, disp, type, f->is_idr ? 1 : 0,
                (unsigned)f->frame_num, poc, tstr, nalr, byte_begin, byte_end);
     }
+    return EXIT_OK;
+}
+
+/*
+ * --list --json: one JSON object on stdout, machine-readable. The same
+ * numbers as the text listing: byte_first/byte_last are the byte_range
+ * bounds (start of the first NAL .. end of the last one), t duplicates
+ * the t column ("- " becomes null), nulls mark unknowns (disp_id, poc).
+ * No Russian text goes to stdout; warnings stay on stderr as before.
+ */
+static int do_list_json(const stream_index_t *idx)
+{
+    size_t i;
+    long double fps;
+    int have_fps;
+
+    have_fps = time_base_fps(idx, &fps) == 0;
+    printf("{\"stream\":{\"frame_count\":%zu,\"poc_supported\":%s,"
+           "\"has_fields\":%s,\"timing\":{\"fps\":",
+           idx->frame_count,
+           idx->poc_supported ? "true" : "false",
+           idx->has_fields ? "true" : "false");
+    if (have_fps)
+        printf("%.9Lg", fps);
+    else
+        fputs("null", stdout);
+    printf(",\"fixed\":%s,\"clock_timing\":%s}},\"frames\":[",
+           idx->fixed_frame_rate ? "true" : "false",
+           idx->clock_timing ? "true" : "false");
+    for (i = 0; i < idx->frame_count; i++) {
+        const frame_t *f = &idx->frames[i];
+        char tstr[32];
+        char disp[32];
+        char poc[32];
+        char ts[32];
+        size_t byte_begin = idx->nals.items[f->nal_first].off;
+        size_t byte_end = idx->nals.items[f->nal_last].off
+                        + idx->nals.items[f->nal_last].size;
+
+        frame_time_str(idx, f, tstr, sizeof(tstr));
+        if (f->display_index < 0)
+            strcpy(disp, "null");
+        else
+            snprintf(disp, sizeof(disp), "%lld", f->display_index);
+        if (!idx->poc_supported || f->parse_error)
+            strcpy(poc, "null");
+        else
+            snprintf(poc, sizeof(poc), "%lld", f->poc);
+        if (f->has_clock_ts)
+            snprintf(ts, sizeof(ts), "%llu",
+                     (unsigned long long)f->clock_ts_90k);
+        else
+            strcpy(ts, "null");
+
+        printf("%s{\"dec_id\":%zu,\"disp_id\":%s,\"type\":\"%c\","
+               "\"idr\":%s,\"frame_num\":%u,\"poc\":%s,\"t\":%s,"
+               "\"leading\":%s,\"recovery\":%s,"
+               "\"recovery_frame_cnt\":%u,\"clock_ts_90k\":%s,"
+               "\"nal_first\":%zu,\"nal_last\":%zu,"
+               "\"byte_first\":%zu,\"byte_last\":%zu}",
+               i ? "," : "",
+               i, disp, f->pic_type,
+               f->is_idr ? "true" : "false",
+               (unsigned)f->frame_num, poc,
+               strcmp(tstr, "-") == 0 ? "null" : tstr,
+               f->leading_picture ? "true" : "false",
+               f->recovery_point ? "true" : "false",
+               (unsigned)f->recovery_frame_cnt, ts,
+               f->nal_first, f->nal_last, byte_begin, byte_end);
+    }
+    fputs("]}\n", stdout);
     return EXIT_OK;
 }
 
@@ -1223,7 +1309,7 @@ int main(int argc, char **argv)
     }
 
     if (opt.list_mode)
-        rc = do_list(&idx);
+        rc = opt.json_mode ? do_list_json(&idx) : do_list(&idx);
     else
         rc = do_cut(&idx, buf, &opt);
 

@@ -39,12 +39,14 @@ enable_testing()
 add_subdirectory(source)
 
 if(ENABLE_SANITIZERS)
-    foreach(san_tgt h264common h264-cut)
+    foreach(san_tgt h264common h264-cut avcc2annexb annexb2avcc)
         target_compile_options(${san_tgt} PRIVATE
             -fsanitize=address,undefined -fno-omit-frame-pointer -g)
     endforeach()
     target_link_options(h264common INTERFACE -fsanitize=address,undefined)
     target_link_options(h264-cut PRIVATE -fsanitize=address,undefined)
+    target_link_options(avcc2annexb PRIVATE -fsanitize=address,undefined)
+    target_link_options(annexb2avcc PRIVATE -fsanitize=address,undefined)
 endif()
 
 add_subdirectory(tests)

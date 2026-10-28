@@ -892,6 +892,170 @@ sm_grep "T22 MBAFF refusal keeps the frame_mbs_only_flag text" \
     "frame_mbs_only_flag = 0" "$WORK/smart_mbaff.err"
 
 # ---------------------------------------------------------------------------
+# T23: AVCC <-> Annex B converters (raw length-prefixed pipeline, no
+#      container). The converter binaries live next to h264-cut in the build
+#      tree (override with AVCC2ANNEXB/ANNEXB2AVCC).
+# ---------------------------------------------------------------------------
+
+# shellcheck disable=SC1007  # CDPATH= cd — env prefix for the command, not an assignment
+BIN_DIR=$(CDPATH= cd -- "$(dirname -- "$BIN")" && pwd)
+AVCC2AB="${AVCC2ANNEXB:-$BIN_DIR/../avcc2annexb/avcc2annexb}"
+AB2AVCC="${ANNEXB2AVCC:-$BIN_DIR/../annexb2avcc/annexb2avcc}"
+for t in "$AVCC2AB" "$AB2AVCC"; do
+    if [ ! -x "$t" ]; then
+        echo "error: converter not executable: $t" >&2
+        exit 2
+    fi
+done
+
+check_rc "T23 annexb2avcc -n 4 exit code" 0 \
+    "$AB2AVCC" "$S1" "$WORK/s1.avcc4"
+check_rc "T23 avcc2annexb -n 4 exit code" 0 \
+    "$AVCC2AB" "$WORK/s1.avcc4" "$WORK/s1.rt4.264"
+if diff -q <(nal_sigs "$S1") <(nal_sigs "$WORK/s1.rt4.264") >/dev/null; then
+    eq23a=identical
+else
+    eq23a="differs: $(diff <(nal_sigs "$S1") <(nal_sigs "$WORK/s1.rt4.264") | head -3 | tr '\n' ' ')"
+fi
+check_eq "T23 NAL sequence after annexb->avcc->annexb equals the source" \
+    "identical" "$eq23a"
+check_eq "T23 -n 4 round-tripped stream decodes without stderr" "clean" \
+    "$(dec_verdict "$WORK/s1.rt4.264")"
+
+check_rc "T23 annexb2avcc -n 2 exit code" 0 \
+    "$AB2AVCC" -n 2 "$S1" "$WORK/s1.avcc2"
+check_rc "T23 avcc2annexb -n 2 exit code" 0 \
+    "$AVCC2AB" -n 2 "$WORK/s1.avcc2" "$WORK/s1.rt2.264"
+if diff -q <(nal_sigs "$S1") <(nal_sigs "$WORK/s1.rt2.264") >/dev/null; then
+    eq23b=identical
+else
+    eq23b="differs: $(diff <(nal_sigs "$S1") <(nal_sigs "$WORK/s1.rt2.264") | head -3 | tr '\n' ' ')"
+fi
+check_eq "T23 -n 2 round-trip NAL sequence equals the source" \
+    "identical" "$eq23b"
+check_rc "T23 annexb2avcc without arguments exits 1" 1 "$AB2AVCC"
+check_rc "T23 annexb2avcc -n 1 is refused (exit 1)" 1 \
+    "$AB2AVCC" -n 1 "$S1" "$WORK/x.avcc"
+check_rc "T23 avcc2annexb -n 5 is refused (exit 1)" 1 \
+    "$AVCC2AB" -n 5 "$WORK/s1.avcc4" "$WORK/x.264"
+
+# T23c: avcC passed via -c supplies the parameter sets a stream lacks. The
+# config is packed from s1's first SPS/PPS with struct.pack; the input ES is
+# the IDR-anchored cut [15..60] (cut_c.264, which decodes cleanly in T8)
+# with its leading SPS/PPS NALs stripped, run through the converters.
+if ! "$PY" - "$S1" "$WORK/cfg.bin" <<'PYEOF'
+import re, struct, sys
+src, dst = sys.argv[1], sys.argv[2]
+data = open(src, "rb").read()
+starts = [m.end() for m in re.finditer(rb"\x00{2,3}\x01", data)]
+sps = pps = None
+for k, h in enumerate(starts):
+    end = starts[k + 1] if k + 1 < len(starts) else len(data)
+    t = data[h] & 0x1F
+    if t == 7 and sps is None:
+        sps = data[h:end].rstrip(b"\x00")
+    elif t == 8 and pps is None:
+        pps = data[h:end].rstrip(b"\x00")
+    if sps and pps:
+        break
+if not sps or not pps:
+    sys.exit("no SPS/PPS pair in the source")
+# High-family profiles need the 14496-15:2013 extended tail in our parser.
+hi = {44, 83, 86, 100, 110, 118, 122, 128, 134, 135, 138, 139, 144, 244}
+cfg = struct.pack(">BBBBBB", 1, sps[1], sps[2], sps[3], 0xFF, 0xE1)
+cfg += struct.pack(">H", len(sps)) + sps
+cfg += struct.pack(">BH", 1, len(pps)) + pps
+if sps[1] in hi:
+    cfg += bytes([0xFD, 0xF8, 0xF8, 0x00])
+open(dst, "wb").write(cfg)
+PYEOF
+then
+    echo "error: cannot pack the avcC config" >&2
+    exit 2
+fi
+if ! "$PY" - "$WORK/cut_c.264" "$WORK/nops.264" <<'PYEOF'
+import re, sys
+src, dst = sys.argv[1], sys.argv[2]
+data = open(src, "rb").read()
+starts = [m.end() for m in re.finditer(rb"\x00{2,3}\x01", data)]
+cut = len(data)
+for h in starts:
+    if (data[h] & 0x1F) not in (7, 8):
+        p = h - 1  # the 0x01 of the start code in front of the first slice
+        while p > 0 and data[p - 1] == 0:
+            p -= 1
+        cut = p
+        break
+open(dst, "wb").write(data[cut:])
+PYEOF
+then
+    echo "error: cannot strip parameter sets from cut_c.264" >&2
+    exit 2
+fi
+check_rc "T23c annexb2avcc on the parameter-set-less cut exits 0" 0 \
+    "$AB2AVCC" "$WORK/nops.264" "$WORK/nops.avcc"
+check_rc "T23c avcc2annexb -c exit code" 0 \
+    "$AVCC2AB" -c "$WORK/cfg.bin" "$WORK/nops.avcc" "$WORK/withcfg.264"
+types23c=$("$PY" "$NALPY" "$WORK/withcfg.264" | awk 'NR <= 2 {printf "%s ", $2}')
+check_eq "T23c -c prepends SPS and PPS before the frames" "7 8 " "$types23c"
+if diff -q <(nal_sigs "$WORK/cut_c.264") \
+        <(nal_sigs "$WORK/withcfg.264") >/dev/null; then
+    eq23c=identical
+else
+    eq23c="differs: $(diff <(nal_sigs "$WORK/cut_c.264") <(nal_sigs "$WORK/withcfg.264") | head -3 | tr '\n' ' ')"
+fi
+check_eq "T23c NAL sequence with -c config equals the original cut" \
+    "identical" "$eq23c"
+check_eq "T23c stream parameterized via -c decodes without stderr" "clean" \
+    "$(dec_verdict "$WORK/withcfg.264")"
+check_rc "T23c avcc2annexb on a corrupt -c config exits 2" 2 \
+    "$AVCC2AB" -c "$WORK/junk.264" "$WORK/nops.avcc" "$WORK/x.264"
+
+# ---------------------------------------------------------------------------
+# T24: --list --json: machine-readable output (json.load parses, counts
+#      match ffprobe, t duplicates the --list column).
+# ---------------------------------------------------------------------------
+
+# check_rc swallows redirections (it runs the command itself), so capture.
+"$BIN" --list --json "$S1" > "$WORK/s1.json" 2>"$WORK/s1.json.err"
+check_eq "T24 --list --json exit code" "0" "$?"
+check_eq "T24 --list --json prints nothing on stderr" "" \
+    "$(cat "$WORK/s1.json.err")"
+if "$PY" - "$WORK/s1.json" "$n_ff" <<'PYEOF'
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["stream"]["frame_count"] == int(sys.argv[2]), d["stream"]
+assert len(d["frames"]) == d["stream"]["frame_count"]
+assert d["frames"][0]["idr"] is True
+assert d["frames"][0]["dec_id"] == 0
+PYEOF
+then
+    ok "T24 --json parses, frame_count == ffprobe, first frame is IDR"
+else
+    ko "T24 --json parses, frame_count == ffprobe, first frame is IDR"
+fi
+mis_t24=0
+for r in 1 13 42; do
+    # list row r (1-based, header stripped) is decoding frame r-1, which is
+    # frames[r-1] in the json array (both are in decoding order).
+    tl=$(list_rows "$WORK/s1.lst" | awk -v n="$r" 'NR == n { print $7 }')
+    tj=$("$PY" -c 'import json, sys
+f = json.load(open(sys.argv[1]))["frames"][int(sys.argv[2])]
+print("-" if f["t"] is None else "%.3f" % f["t"])' "$WORK/s1.json" "$((r - 1))")
+    if [ "$tl" != "$tj" ]; then
+        mis_t24=$((mis_t24 + 1))
+    fi
+done
+check_eq "T24 json t matches the list t column on rows 1/13/42" \
+    "0" "$mis_t24"
+check_rc "T24 --json without --list is refused (exit 1)" 1 \
+    "$BIN" --json "$S1"
+check_rc "T24 --json with -f/-o is refused (exit 1)" 1 \
+    "$BIN" --json -f 5 -o "$WORK/x.264" "$S1"
+check_rc "T24 --json --list -o is refused (exit 1)" 1 \
+    "$BIN" --json --list -o "$WORK/x.264" "$S1"
+
+# ---------------------------------------------------------------------------
 # --smart smoke: --crf bounds and option mixing (usage errors are checked
 # unconditionally: parse-time refusals do not need smart support).
 # ---------------------------------------------------------------------------

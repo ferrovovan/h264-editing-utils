@@ -5,3 +5,5 @@
 add_subdirectory(vendor)
 add_subdirectory(common)
 add_subdirectory(h264-cut)
+add_subdirectory(avcc2annexb)
+add_subdirectory(annexb2avcc)
