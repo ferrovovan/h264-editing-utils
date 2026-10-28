@@ -1,0 +1,3 @@
+[submodule "source/vendor/h264bitstream"]
+	path = source/vendor/h264bitstream
+	url = https://github.com/aizvorski/h264bitstream
