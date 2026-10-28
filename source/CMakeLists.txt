@@ -3,3 +3,5 @@
 # SPDX short: GPLv3+ — see /COPYING/COPYING at the project root.
 
 add_subdirectory(vendor)
+add_subdirectory(common)
+add_subdirectory(h264-cut)
