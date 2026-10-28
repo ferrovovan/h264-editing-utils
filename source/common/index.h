@@ -37,6 +37,20 @@ typedef struct {
     long long poc;               /* PicOrderCnt, reset at every IDR; -1 if unknown */
     long long display_index;     /* position in display order; -1 if unknown */
     int parse_error;             /* slice header parse failed for this frame */
+    /* Open GOP (recovery point SEI, spec D.1.7): */
+    int recovery_point;          /* AU carries a recovery_point SEI */
+    uint32_t recovery_frame_cnt;
+    int exact_match_flag;
+    int broken_link_flag;
+    int usable_anchor;           /* IDR, or recovery usable to cut from:
+                                  * recovery_frame_cnt == 0 && exact_match
+                                  * && !broken_link */
+    int leading_picture;         /* non-ref AU right after an anchor with
+                                  * poc < poc(anchor): decodes with broken
+                                  * references when cut starts at the anchor */
+    /* SEI picture timing (E.1.2, cnt_type 0 / n_90kHz 0), unwrapped: */
+    int has_clock_ts;
+    uint64_t clock_ts_90k;       /* 1/90000 s units, day-wraps unwrapped */
 } frame_t;
 
 typedef struct {
@@ -46,12 +60,13 @@ typedef struct {
     param_store_t params;        /* final parameter set state after the scan */
     frame_t *frames;
     size_t frame_count;
-    int poc_supported;           /* 0 if pic_order_cnt_type == 1 anywhere */
+    int poc_supported;           /* 0 if an unknown pic_order_cnt_type was seen */
     int has_fields;              /* interlaced content seen (fields counted as frames) */
     int timing_valid;            /* first parsed SPS carried VUI timing */
     uint32_t time_scale;
     uint32_t num_units_in_tick;
     int fixed_frame_rate;
+    int clock_timing;            /* frame_count > 0 and every frame has_clock_ts */
 } stream_index_t;
 
 /*

@@ -85,8 +85,8 @@ nal_sigs() {
 # prepends when the first AU does not carry them.
 expected_nals() {
     local lst=$1 src=$2 a=$3 b=$4 lo hi
-    lo=$(list_rows "$lst" | awk -v i="$a" 'NR==i+1{split($7,r,"-");print r[1]}')
-    hi=$(list_rows "$lst" | awk -v i="$b" 'NR==i+1{split($7,r,"-");print r[2]}')
+    lo=$(list_rows "$lst" | awk -v i="$a" 'NR==i+1{split($8,r,"-");print r[1]}')
+    hi=$(list_rows "$lst" | awk -v i="$b" 'NR==i+1{split($8,r,"-");print r[2]}')
     "$PY" "$NALPY" "$src" | awk -v lo="$lo" -v hi="$hi" '
         $1 < lo && $2 == 7 { last_sps = $2 " " $4 }
         $1 < lo && $2 == 8 { last_pps = $2 " " $4 }
@@ -174,7 +174,7 @@ check_eq "T1 pict_type multiset (decode vs display)" "$mset_ff" "$mset_list"
 # ---------------------------------------------------------------------------
 
 bad_group=$(list_rows "$WORK/s2.lst" | awk '
-    $4 != 1 { split($7, r, "-"); if (r[2] - r[1] + 1 < 2) bad++ }
+    $4 != 1 { split($8, r, "-"); if (r[2] - r[1] + 1 < 2) bad++ }
     END { print bad + 0 }')
 check_eq "T2 every non-IDR frame has >= 2 slice NALs" "0" "$bad_group"
 
@@ -302,6 +302,244 @@ else
 fi
 mismatch=$(list_rows "$WORK/s3.lst" | awk '$1 != $2' | wc -l)
 check_eq "T10 display index equals decode index everywhere" "0" "$mismatch"
+
+# ---------------------------------------------------------------------------
+# T11: open GOP (x264 open-gop): recovery point SEI as cut anchor,
+#      leading pictures marked in --list (type suffixes R / L).
+#      scenecut=0 -> deterministic keying (AGENTS pitfall 7): IDR at 0,
+#      recovery point at the keyint=50 boundary (frame 50, the scene change
+#      of the concat), its leading picture right behind in decode order.
+# ---------------------------------------------------------------------------
+
+if ! ffmpeg -v error -f lavfi -i "testsrc=size=176x144:rate=25:duration=2" \
+        -f lavfi -i "smptebars=size=176x144:rate=25:duration=2" \
+        -filter_complex "[0:v]format=yuv420p[a0];[1:v]format=yuv420p[a1];[a0][a1]concat=n=2:v=1[a]" \
+        -map "[a]" -c:v libx264 -g 50 -x264-params open-gop=1:scenecut=0 \
+        -an -y "$WORK/s6.264" 2>"$WORK/gen.err"; then
+    echo "error: cannot generate open-gop stream: $(cat "$WORK/gen.err")" >&2
+    exit 2
+fi
+S6="$WORK/s6.264"
+"$BIN" --list "$S6" > "$WORK/s6.lst" || { echo "fatal: --list failed on s6" >&2; exit 2; }
+
+n_r=$(list_rows "$WORK/s6.lst" | awk '$3 ~ /R/' | wc -l)
+n_l=$(list_rows "$WORK/s6.lst" | awk '$3 ~ /L/' | wc -l)
+if [ "$n_r" -gt 0 ]; then
+    ok "T11 open GOP: recovery point(s) in --list ($n_r rows with type suffix R)"
+else
+    ko "T11 open GOP: no recovery point (type suffix R) in --list — x264 wrote no usable recovery SEI or detection is broken"
+fi
+if [ "$n_l" -gt 0 ]; then
+    ok "T11 open GOP: leading picture(s) in --list ($n_l rows with type suffix L)"
+else
+    ko "T11 open GOP: no leading picture (type suffix L) in --list — open-gop leading detection broken"
+fi
+
+if [ "$n_r" -gt 0 ]; then
+    ridx=$(list_rows "$WORK/s6.lst" | awk '$3 ~ /R/ {print $1; exit}')
+    bend=$((ridx + 40))
+    "$BIN" -f $((ridx + 1)) -t "$bend" -o "$WORK/cut_open.264" "$S6" \
+        2>"$WORK/cut_open.err"
+    if grep -q "левая граница сдвинута к recovery point (кадр $ridx)" \
+            "$WORK/cut_open.err"; then
+        ok "T11 left boundary snaps to recovery frame $ridx, not the earlier IDR"
+    else
+        ko "T11 left boundary snaps to recovery frame $ridx (stderr: $(tr '\n' ';' < "$WORK/cut_open.err"))"
+    fi
+    if grep -q "leading-кадров открытых GOP внутри диапазона" "$WORK/cut_open.err"; then
+        ok "T11 stderr warns about leading pictures carried with broken dependencies"
+    else
+        ko "T11 stderr warns about leading pictures in the cut range"
+    fi
+    check_nal_eq "T11 NAL sequence of the recovery-anchored cut [$ridx..$bend]" \
+        "$WORK/s6.lst" "$S6" "$WORK/cut_open.264" "$ridx" "$bend"
+    if ffmpeg -v error -i "$WORK/cut_open.264" -f null - 2>"$WORK/dec_open.err"; then
+        if [ -s "$WORK/dec_open.err" ]; then
+            ko "T11 recovery-anchored cut decodes without stderr"
+        else
+            ok "T11 recovery-anchored cut decodes without stderr"
+        fi
+    else
+        ko "T11 recovery-anchored cut decodes without stderr"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# T12: SEI picture timing (cnt_type 0 clock timestamps) as --exact time base.
+#      x264 0.165 writes no picture timing clock timestamps at all
+#      (-x264-params pic-timing=1 yields not a single SEI NAL beyond the
+#      x264 user_data one), so the test injects one picture_timing SEI per
+#      AU into the no-B-frames stream s3 (decode order == display order),
+#      raw ts = frame_index * 3600 ticks (25 fps, 1/90000 s units).
+#      x264's VUI has fixed_frame_rate_flag = 0, so the clock path is the
+#      one actually exercised.
+# ---------------------------------------------------------------------------
+
+if ! "$PY" - "$S3" "$WORK/s5.264" <<'PYEOF'
+import re, sys
+src, dst = sys.argv[1], sys.argv[2]
+data = open(src, "rb").read()
+starts = [m.start() for m in re.finditer(b'\x00\x00\x01', data)]
+def esc(p):
+    out, z = bytearray(), 0
+    for b in p:
+        if z >= 2 and b <= 3:
+            out.append(3); z = 0
+        out.append(b); z = z + 1 if b == 0 else 0
+    return bytes(out)
+def sei(i):  # payloadType 1, clock ts: flag=1, cnt_type=00, n_90kHz=0, u24
+    bits = "1" + "00" + "0" + format(i * 3600, "024b") + "0" * 17
+    bits += "1"
+    bits += "0" * (-len(bits) % 8)
+    payload = bytes(int(bits[k:k+8], 2) for k in range(0, len(bits), 8))
+    return b"\x00\x00\x00\x01\x06\x01" + bytes([len(payload)]) + esc(payload + b"\x80")
+out, n = bytearray(), 0
+for k, st in enumerate(starts):
+    end = starts[k + 1] if k + 1 < len(starts) else len(data)
+    if (data[st + 3] & 0x1f) in (1, 5) and (data[st + 4] & 0x80):  # first_mb_in_slice == 0
+        out += sei(n); n += 1
+    out += data[st:end]
+if n == 0:
+    sys.exit("no AUs found for SEI injection")
+open(dst, "wb").write(out)
+PYEOF
+then
+    echo "error: cannot inject picture timing SEIs into s3" >&2
+    exit 2
+fi
+S5="$WORK/s5.264"
+"$BIN" --list "$S5" > "$WORK/s5.lst" || { echo "fatal: --list failed on s5" >&2; exit 2; }
+
+no_t=$(list_rows "$WORK/s5.lst" | awk '$7 == "-"' | wc -l)
+check_eq "T12 --list: t column present for every frame (clock base)" "0" "$no_t"
+t_first=$(list_rows "$WORK/s5.lst" | awk 'NR==1 {print $7}')
+t_second=$(list_rows "$WORK/s5.lst" | awk 'NR==2 {print $7}')
+check_eq "T12 t of the first frame" "0.000" "$t_first"
+check_eq "T12 t of the second frame" "0.040" "$t_second"
+
+check_rc "T12 --exact via clock base exits 0" 0 \
+    "$BIN" --exact 00:00:00.500-00:00:02.500 -o "$WORK/cut_clk.264" "$S5"
+"$BIN" --exact 00:00:00.500-00:00:02.500 -o /dev/null "$S5" 2>"$WORK/cut_clk.err"
+if grep -q "display-время взято из SEI picture timing (VFR)" "$WORK/cut_clk.err"; then
+    ok "T12 stderr notes that display time comes from SEI picture timing"
+else
+    ko "T12 stderr notes that display time comes from SEI picture timing"
+fi
+check_rc "T12 --exact --fps exits 0" 0 \
+    "$BIN" --exact 00:00:00.500-00:00:02.500 --fps 25 \
+    -o "$WORK/cut_clkfps.264" "$S5"
+if cmp -s "$WORK/cut_clk.264" "$WORK/cut_clkfps.264"; then
+    ok "T12 clock window equals the --fps window (byte-identical cuts)"
+else
+    ko "T12 clock window equals the --fps window (byte-identical cuts)"
+fi
+if ffmpeg -v error -i "$WORK/cut_clk.264" -f null - 2>"$WORK/dec_clk.err" \
+        && [ ! -s "$WORK/dec_clk.err" ]; then
+    ok "T12 clock-based cut decodes without stderr"
+else
+    ko "T12 clock-based cut decodes without stderr"
+fi
+
+# ---------------------------------------------------------------------------
+# T13: --list column layout regression after adding the t column:
+#      dec_id disp_id type idr frame_num poc t nal_range byte_range.
+# ---------------------------------------------------------------------------
+
+check_eq "T13 --list header layout" \
+    "# dec_id disp_id type idr frame_num poc t nal_range byte_range" \
+    "$(head -1 "$WORK/s1.lst" | awk '{$1=$1};1')"
+bad_cols=$(for l in s1 s2 s3 s6; do list_rows "$WORK/$l.lst"; done | awk '
+    NF != 9 { bad++; next }
+    $8 !~ /^[0-9]+-[0-9]+$/ { bad++; next }
+    $9 !~ /^[0-9]+-[0-9]+$/ { bad++ }
+    END { print bad + 0 }')
+check_eq "T13 all rows have 9 columns, nal_range at \$8, byte_range at \$9" \
+    "0" "$bad_cols"
+t_dash=$(for l in s1 s2 s3; do list_rows "$WORK/$l.lst"; done | awk '$7 == "-"' | wc -l)
+check_eq "T13 VUI streams (x264 fixed flag unset): t falls back to VUI fps, never '-'" \
+    "0" "$t_dash"
+
+# ---------------------------------------------------------------------------
+# T14: stream starting in the middle of a GOP (no usable anchor at its head).
+#      `ffmpeg -ss 1.3 -i s1 -c copy -f h264` cannot produce such a stream
+#      from raw ES: as an input option -ss makes this ffmpeg seek past the
+#      timestamps of a raw H.264 stream and write an EMPTY file; as an
+#      output option it snaps the start to the IDR at 1.2 s. So the mid-GOP
+#      start is built deterministically from bytes: the leading SPS/PPS
+#      prefix of s1 plus everything from the byte_range start of the frame
+#      at decode index 7 (a P frame inside the first GOP, g=15).
+# ---------------------------------------------------------------------------
+
+mid_off=$(list_rows "$WORK/s1.lst" | awk '$1 == 7 {split($9, r, "-"); print r[1]}')
+if ! "$PY" - "$S1" "$WORK/mid.264" "$mid_off" <<'PYEOF'
+import re, sys
+src, dst, off = sys.argv[1], sys.argv[2], int(sys.argv[3])
+data = open(src, "rb").read()
+starts = [m.end() for m in re.finditer(b"\x00{2,3}\x01", data)]
+out = bytearray()
+for k, h in enumerate(starts):
+    end = starts[k + 1] if k + 1 < len(starts) else len(data)
+    if (data[h] & 0x1f) in (7, 8):  # leading parameter sets
+        out += b"\x00\x00\x00\x01" + data[h:end]
+    else:
+        break
+out += data[off - 3:]  # 3-byte start code before the mid-GOP slice NAL
+open(dst, "wb").write(out)
+PYEOF
+then
+    echo "error: cannot build mid-GOP stream" >&2
+    exit 2
+fi
+MID="$WORK/mid.264"
+"$BIN" --list "$MID" > "$WORK/mid.lst" 2>"$WORK/mid.err"
+check_eq "T14 --list on mid-GOP stream exits 0" "0" "$?"
+mid_rows=$(list_rows "$WORK/mid.lst" | wc -l)
+if [ "$mid_rows" -gt 0 ]; then
+    ok "T14 mid-GOP stream indexed ($mid_rows frames; frames before the first IDR may be invalid)"
+else
+    ko "T14 mid-GOP stream indexed (no frames in --list)"
+fi
+"$BIN" -f 0 -o "$WORK/mid_f0.264" "$MID" 2>"$WORK/mid_f0.err"
+check_eq "T14 cut from frame 0 exits 3 (no anchor at or before it)" "3" "$?"
+if grep -q "no cut anchor" "$WORK/mid_f0.err"; then
+    ok "T14 stderr reports 'no cut anchor' for the mid-GOP start"
+else
+    ko "T14 stderr reports 'no cut anchor' (stderr: $(tr '\n' ';' < "$WORK/mid_f0.err"))"
+fi
+ridx=$(list_rows "$WORK/mid.lst" | awk '$4 == 1 {print $1; exit}')
+if [ -n "$ridx" ]; then
+    ok "T14 mid-GOP stream has its first IDR at decode index $ridx"
+    "$BIN" -f "$ridx" -o "$WORK/mid_idr.264" "$MID" 2>/dev/null
+    check_eq "T14 cut from the first listed IDR exits 0" "0" "$?"
+    if ffmpeg -v error -i "$WORK/mid_idr.264" -f null - 2>"$WORK/dec_mid.err" \
+            && [ ! -s "$WORK/dec_mid.err" ]; then
+        ok "T14 mid-GOP cut from the IDR decodes without stderr"
+    else
+        ko "T14 mid-GOP cut from the IDR decodes without stderr ($(tr '\n' ';' < "$WORK/dec_mid.err"))"
+    fi
+else
+    ko "T14 mid-GOP stream has its first IDR at decode index (none found in --list)"
+fi
+
+# ---------------------------------------------------------------------------
+# T15: truncated tail (60% of s1): the last AU is cut mid-NAL. --list must
+#      still index the stream and a full-range cut must still work; the
+#      last frame may come out as parse_error '?'.
+# ---------------------------------------------------------------------------
+
+sz=$(stat -c %s "$S1")
+head -c $((sz * 60 / 100)) "$S1" > "$WORK/trunc.264"
+"$BIN" --list "$WORK/trunc.264" > "$WORK/trunc.lst" 2>"$WORK/trunc.err"
+check_eq "T15 --list on tail-truncated stream exits 0" "0" "$?"
+trunc_rows=$(list_rows "$WORK/trunc.lst" | wc -l)
+if [ "$trunc_rows" -gt 0 ]; then
+    ok "T15 truncated stream indexed ($trunc_rows frames)"
+else
+    ko "T15 truncated stream indexed (no frames in --list)"
+fi
+"$BIN" -f 0 -t $((trunc_rows - 1)) -o "$WORK/trunc_cut.264" "$WORK/trunc.264" \
+    2>/dev/null
+check_eq "T15 full-range cut of the truncated stream exits 0" "0" "$?"
 
 # ---------------------------------------------------------------------------
 # Summary

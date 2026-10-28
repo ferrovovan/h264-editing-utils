@@ -24,6 +24,74 @@
 
 #include "bits.h"
 #include "index.h"
+#include "sei.h"
+
+/* One day in 1/90000 s units (clock_timestamp wraps with this period, D.2). */
+#define DAY_90K ((uint64_t)90000 * 24 * 3600)
+
+/*
+ * SEI content parsed from the AUs seen so far, waiting for the frame it
+ * belongs to (parametric NALs are attributed to the NEXT frame, so pending
+ * records are attached when that frame is created).
+ */
+typedef struct {
+    int have_recovery;
+    sei_recovery_point_t recovery;
+    int have_clock;
+    uint64_t clock_raw;   /* raw (still wrapped) clock ts of the pending AU */
+    uint64_t ts_base;     /* accumulated day unwraps */
+    uint64_t prev_raw;    /* raw ts of the previous picture with clock ts */
+    int have_prev;
+} sei_pending_t;
+
+static void attach_sei_pending(frame_t *f, sei_pending_t *p)
+{
+    if (p->have_recovery) {
+        f->recovery_point = 1;
+        f->recovery_frame_cnt = p->recovery.recovery_frame_cnt;
+        f->exact_match_flag = p->recovery.exact_match_flag;
+        f->broken_link_flag = p->recovery.broken_link_flag;
+        if (!f->is_idr) {
+            f->usable_anchor =
+                p->recovery.recovery_frame_cnt == 0 &&
+                p->recovery.exact_match_flag &&
+                !p->recovery.broken_link_flag;
+        }
+        p->have_recovery = 0;
+    }
+    if (p->have_clock) {
+        uint64_t raw = p->clock_raw;
+        /* One-sided unwrap: the clock restarts at 0 once a day, so a drop
+         * of more than half a day against the previous picture means the
+         * day counter advanced. No anchor reset: base keeps accumulating,
+         * which is enough for monotonic ts inside every segment. */
+        if (p->have_prev && raw < p->prev_raw &&
+                p->prev_raw - raw > DAY_90K / 2) {
+            p->ts_base += DAY_90K;
+        }
+        p->prev_raw = raw;
+        p->have_prev = 1;
+        f->has_clock_ts = 1;
+        f->clock_ts_90k = p->ts_base + raw;
+        p->have_clock = 0;
+    }
+}
+
+/* pic_struct_present_flag of the SPS referenced by the most recently seen
+ * PPS (the "active" parameter state at SEI parse time); 0 when unavailable. */
+static int active_pic_struct_present(const stream_index_t *idx, int last_pps_id)
+{
+    const pps_state_t *pps;
+
+    if (last_pps_id < 0) {
+        return 0;
+    }
+    pps = &idx->params.pps[last_pps_id];
+    if (!pps->valid || pps->sps_id < 0 || pps->sps_id >= 32) {
+        return 0;
+    }
+    return idx->params.sps[pps->sps_id].pic_struct_present_flag ? 1 : 0;
+}
 
 static frame_t *push_frame(frame_t **frames, size_t *count, size_t *cap)
 {
@@ -45,9 +113,11 @@ static frame_t *push_frame(frame_t **frames, size_t *count, size_t *cap)
 }
 
 /*
- * Sort frame indices inside each IDR segment by (poc, decoding order) and
- * assign display_index. All display indexes are set to -1 when POC is not
- * usable for every frame.
+ * Sort frame indices inside each anchor segment (segments start at an IDR
+ * or at a recovery point SEI) by (poc, decoding order) and assign
+ * display_index. All display indexes are set to -1 when POC is not usable
+ * for every frame. Negative POCs are legitimate: leading pictures of an
+ * open GOP after an IDR sort in front of their anchor.
  */
 static void compute_display(stream_index_t *idx)
 {
@@ -63,7 +133,7 @@ static void compute_display(stream_index_t *idx)
         return;
     }
     for (i = 0; i < idx->frame_count; i++) {
-        if (idx->frames[i].poc < 0) {
+        if (idx->frames[i].parse_error) {
             return;
         }
     }
@@ -75,7 +145,9 @@ static void compute_display(stream_index_t *idx)
         return;
     }
     for (i = 0; i <= idx->frame_count; i++) {
-        if (i == idx->frame_count || (i > 0 && idx->frames[i].is_idr)) {
+        if (i == idx->frame_count ||
+                (i > 0 && (idx->frames[i].is_idr ||
+                           idx->frames[i].recovery_point))) {
             size_t n = i - seg_start;
             size_t j, k;
             for (j = 0; j < n; j++) {
@@ -119,6 +191,10 @@ int index_build(stream_index_t *idx, const uint8_t *buf, size_t size)
     long long prev_frame_num = 0;
     long long prev_fn_offset = 0;
     int last_sps_id = -1;
+    int last_pps_id = -1;
+    sei_pending_t pending;
+    int have_anchor = 0;
+    long long anchor_poc = 0;
     /*
      * First NAL not yet attributed to any frame. Parametric NALs (SPS, PPS,
      * SEI, AUD, filler, ...) that precede a slice join the frame that the
@@ -128,6 +204,7 @@ int index_build(stream_index_t *idx, const uint8_t *buf, size_t size)
     size_t nal_start = 0;
 
     memset(idx, 0, sizeof(*idx));
+    memset(&pending, 0, sizeof(pending));
     idx->buf = buf;
     idx->size = size;
     idx->poc_supported = 1;
@@ -152,24 +229,30 @@ int index_build(stream_index_t *idx, const uint8_t *buf, size_t size)
         frame_t *f;
 
         if (nal->type == NAL_SPS || nal->type == NAL_PPS) {
+            bits_t b;
+            uint32_t id;
+
             params_feed_nal(&idx->params, buf, nal);
-            if (nal->type != NAL_SPS) {
-                continue;
-            }
-            /* Retrieve the SPS id to detect parameter changes / VUI timing. */
+            /* Read the parameter set id: the SPS id to detect parameter
+             * changes / VUI timing, the PPS id to know the active SPS for
+             * SEI picture timing parsing. */
             rbsp = annexb_rbsp(buf, nal, &rbsp_size);
             if (!rbsp) {
                 goto fail;
             }
-            {
-                bits_t b;
-                uint32_t id;
-                bits_init(&b, rbsp + 1, rbsp_size - 1);
+            bits_init(&b, rbsp + 1, rbsp_size - 1);
+            if (nal->type == NAL_SPS) {
                 bits_read_u(&b, 8); /* profile_idc */
                 bits_read_u(&b, 8); /* constraint flags */
                 bits_read_u(&b, 8); /* level_idc */
-                id = bits_read_ue(&b);
-                if (!bits_error(&b) && id < 32) {
+            }
+            id = bits_read_ue(&b);
+            if (!bits_error(&b)) {
+                if (nal->type == NAL_PPS) {
+                    if (id < 256) {
+                        last_pps_id = (int)id;
+                    }
+                } else if (id < 32) {
                     if ((int)id != last_sps_id) {
                         last_sps_id = (int)id;
                         prev_msb = 0;
@@ -191,6 +274,44 @@ int index_build(stream_index_t *idx, const uint8_t *buf, size_t size)
             continue;
         }
 
+        if (nal->type == NAL_SEI) {
+            sei_iter_t it;
+            sei_msg_t msg;
+
+            rbsp = annexb_rbsp(buf, nal, &rbsp_size);
+            if (!rbsp) {
+                goto fail;
+            }
+            /* RBSP after the nal header byte; malformed messages simply
+             * end the iteration (sei_iter_next never fails hard). */
+            sei_iter_init(&it, rbsp + 1, rbsp_size > 0 ? rbsp_size - 1 : 0);
+            while (sei_iter_next(&it, &msg)) {
+                if (msg.type == SEI_PAYLOAD_RECOVERY_POINT) {
+                    sei_recovery_point_t rp;
+                    if (sei_parse_recovery_point(&msg, &rp) == 0) {
+                        /* Several recovery points in one AU: last one wins
+                         * ("any"), they cannot legitimately coexist. */
+                        pending.recovery = rp;
+                        pending.have_recovery = 1;
+                    }
+                } else if (msg.type == SEI_PAYLOAD_PICTURE_TIMING) {
+                    sei_picture_timing_t pt;
+                    if (!pending.have_clock &&
+                            sei_parse_picture_timing(
+                                &msg,
+                                active_pic_struct_present(idx, last_pps_id),
+                                &pt) == 0 &&
+                            pt.supported) {
+                        /* First supported clock timestamp of the AU. */
+                        pending.clock_raw = pt.clock_ts_90k;
+                        pending.have_clock = 1;
+                    }
+                }
+            }
+            free(rbsp);
+            continue;
+        }
+
         if (nal->type < NAL_SLICE || nal->type > NAL_IDR) {
             continue;
         }
@@ -199,8 +320,8 @@ int index_build(stream_index_t *idx, const uint8_t *buf, size_t size)
         if (!rbsp) {
             goto fail;
         }
-        if (slice_header_parse(&idx->params, nal->type, rbsp + 1,
-                               rbsp_size - 1, &hdr) != 0) {
+        if (slice_header_parse(&idx->params, nal->type, nal->ref_idc,
+                               rbsp + 1, rbsp_size - 1, &hdr) != 0) {
             free(rbsp);
             rbsp = NULL;
         }
@@ -218,6 +339,8 @@ int index_build(stream_index_t *idx, const uint8_t *buf, size_t size)
             f->frame_num = 0;
             f->poc = -1;
             f->parse_error = 1;
+            f->usable_anchor = f->is_idr;
+            attach_sei_pending(f, &pending);
             have_cur = 0;
             nal_start = i + 1;
             continue;
@@ -248,6 +371,8 @@ int index_build(stream_index_t *idx, const uint8_t *buf, size_t size)
             f->is_idr = (nal->type == NAL_IDR);
             f->pic_type = hdr.pic_type;
             f->frame_num = hdr.frame_num;
+            f->usable_anchor = (nal->type == NAL_IDR);
+            attach_sei_pending(f, &pending);
 
             have_cur = 1;
             cur_ref_idc = nal->ref_idc;
@@ -314,11 +439,80 @@ int index_build(stream_index_t *idx, const uint8_t *buf, size_t size)
                 poc = 2 * (fn_offset + fn) - (nal->ref_idc != 0 ? 0 : 1);
                 prev_fn_offset = fn_offset;
                 prev_frame_num = fn;
+            } else if (sps->pic_order_cnt_type == 1) {
+                /* spec 8.2.1.2 (8.2.1.1 in the 2003 edition), cross-checked
+                 * against FFmpeg ff_h264_init_poc. Progressive frames only:
+                 * interlaced branches and the mmco-5 FrameNumOffset reset are
+                 * out of scope (B7). POC type 1 carries no PicOrderCntMsb/
+                 * PicOrderCntLsb state: the POC is derived absolutely from the
+                 * unwrapped FrameNumOffset (8-6), which plays the role of the
+                 * msb; a picture unreferenced via dec_ref_pic_marking keeps
+                 * the POC of its nal_ref_idc (8-9 uses nal_ref_idc only). */
+                long long fn = (long long)hdr.frame_num;
+                long long fn_offset = prev_fn_offset;
+                long long abs_fn, expected = 0;
+                long long cyc_len = sps->num_ref_frames_in_pic_order_cnt_cycle;
+                long long k;
+                if (nal->type == NAL_IDR) {
+                    fn_offset = 0;
+                } else if (prev_frame_num > fn) {
+                    fn_offset += sps->max_frame_num;
+                }
+                abs_fn = (cyc_len != 0) ? fn_offset + fn : 0;
+                if (nal->ref_idc == 0 && abs_fn > 0) {
+                    abs_fn--;
+                }
+                if (abs_fn > 0) {
+                    long long delta_per_cycle = 0;
+                    for (k = 0; k < cyc_len; k++) {
+                        delta_per_cycle += sps->offset_for_ref_frame[k];
+                    }
+                    expected = ((abs_fn - 1) / cyc_len) * delta_per_cycle;
+                    for (k = 0; k <= (abs_fn - 1) % cyc_len; k++) {
+                        expected += sps->offset_for_ref_frame[k];
+                    }
+                }
+                if (nal->ref_idc == 0) {
+                    expected += sps->offset_for_non_ref_pic;
+                }
+                poc = expected + hdr.delta_poc0;
+                if (nal->type == NAL_IDR) {
+                    poc = 0;
+                }
+                /* IDR resets the whole tracking state (prev_frame_num is 0
+                 * after an IDR by conformance; FFmpeg resets it explicitly). */
+                prev_fn_offset = (nal->type == NAL_IDR) ? 0 : fn_offset;
+                prev_frame_num = (nal->type == NAL_IDR) ? 0 : fn;
             } else {
                 idx->poc_supported = 0;
                 poc = -1;
             }
             f->poc = poc;
+
+            /*
+             * Open GOP bookkeeping (B5). Leading picture: a non-ref AU after
+             * an anchor (IDR or recovery point) whose POC is below the
+             * anchor's - it decodes with references from before the anchor,
+             * so a cut starting at the anchor carries it with broken
+             * dependencies. The check uses the anchor before this frame;
+             * then this frame becomes the new anchor if it is one.
+             */
+            if (!f->is_idr && nal->ref_idc == 0 && have_anchor &&
+                    idx->poc_supported && poc < anchor_poc) {
+                f->leading_picture = 1;
+            }
+            if (f->is_idr || f->recovery_point) {
+                have_anchor = 1;
+                anchor_poc = poc;
+            }
+        }
+    }
+
+    idx->clock_timing = frame_count > 0;
+    for (i = 0; i < frame_count; i++) {
+        if (!frames[i].has_clock_ts) {
+            idx->clock_timing = 0;
+            break;
         }
     }
 

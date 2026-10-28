@@ -1,0 +1,5 @@
+Unity v2 (ThrowTheSwitch), MIT — vendored copy.
+
+Source: https://github.com/ThrowTheSwitch/Unity (master, vendored 2026-10-28).
+Files: unity.c, unity.h, unity_internals.h (from src/), LICENSE.txt.
+MIT is GPL-3.0-compatible; only used by test binaries under tests/unit/.

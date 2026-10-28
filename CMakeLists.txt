@@ -27,9 +27,25 @@ endif()
 
 add_compile_options(-Wall -Wextra)
 
+# ASAN+UBSAN for OUR targets only (vendor h264bitstream and Unity stay
+# uninstrumented). The link flags propagate transitively to every consumer
+# binary, so the sanitizer runtime is linked into h264-cut and the unit tests.
+option(ENABLE_SANITIZERS "Build h264common and h264-cut with ASAN+UBSAN" OFF)
+
 enable_testing()
 
 add_subdirectory(source)
+
+if(ENABLE_SANITIZERS)
+    foreach(san_tgt h264common h264-cut)
+        target_compile_options(${san_tgt} PRIVATE
+            -fsanitize=address,undefined -fno-omit-frame-pointer -g)
+    endforeach()
+    target_link_options(h264common INTERFACE -fsanitize=address,undefined)
+    target_link_options(h264-cut PRIVATE -fsanitize=address,undefined)
+endif()
+
+add_subdirectory(tests)
 
 add_test(NAME integration
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/run.sh $<TARGET_FILE:h264-cut>)

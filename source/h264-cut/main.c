@@ -63,15 +63,22 @@ static void usage(FILE *out)
 {
     fputs("usage: h264-cut [опции] INPUT.264\n"
           "  -l, --list            список кадров в stdout и выход 0"
-          " (не совместимо с -f/-t/-e/-o)\n"
+          " (не совместимо с -f/-t/-e/-o);\n"
+          "                        колонка t — display-время (сек),"
+          " суффиксы типа: L — leading\n"
+          "                        picture открытой GOP, R — recovery point\n"
           "  -f, --from-frame N    первый сохраняемый кадр (0-based,"
           " порядок декодирования, включительно)\n"
           "  -t, --to-frame M      последний сохраняемый кадр (0-based,"
           " порядок декодирования, включительно; по умолчанию последний)\n"
           "  -e, --exact T0-T1     диапазон по времени отображения,"
           " HH:MM:SS.mmm-HH:MM:SS.mmm (миллисекунды необязательны)\n"
-          "      --fps FPS         явный fps (десятичный), иначе из SPS VUI\n"
-          "  -o, --output FILE     файл результата (обязателен для вырезания)\n"
+          "      --fps FPS         явный fps (десятичный); таймбаза по"
+          " умолчанию: VUI fixed-fps,\n"
+          "                        иначе SEI picture timing (clock ts, VFR"
+          " — с предупреждением)\n"
+          "  -o, --output FILE     файл результата (обязателен для"
+          " вырезания)\n"
           "  -h, --help            эта справка\n",
           out);
 }
@@ -386,15 +393,51 @@ static uint8_t *read_whole_file(const char *path, size_t *out_size)
     return buf;
 }
 
+/* VUI-derived constant fps following the --exact time-base priority
+ * (fixed flag first, then SEI clock ts, then VUI without the flag);
+ * returns 0 when an fps value was produced. */
+static int time_base_fps(const stream_index_t *idx, long double *fps)
+{
+    if (idx->timing_valid && idx->num_units_in_tick > 0) {
+        if (idx->fixed_frame_rate || !idx->clock_timing) {
+            *fps = (long double)idx->time_scale
+                 / (2.0L * (long double)idx->num_units_in_tick);
+            if (*fps > 0.0L) {
+                return 0;
+            }
+        }
+    }
+    return -1;
+}
+
+/* Display time of a frame, seconds as "%.3f", "-" when no time base. */
+static void frame_time_str(const stream_index_t *idx, const frame_t *f,
+                           char *out, size_t n)
+{
+    long double fps;
+
+    if (time_base_fps(idx, &fps) == 0 && f->display_index >= 0) {
+        snprintf(out, n, "%.3Lf", (long double)f->display_index / fps);
+        return;
+    }
+    if (idx->clock_timing) {
+        snprintf(out, n, "%.3Lf",
+                 (long double)f->clock_ts_90k / 90000.0L);
+        return;
+    }
+    strcpy(out, "-");
+}
+
 static int do_list(const stream_index_t *idx)
 {
     size_t i;
 
-    fputs("# dec_id disp_id type idr frame_num poc   nal_range   byte_range\n",
+    fputs("# dec_id disp_id type idr frame_num poc   t        "
+          "nal_range   byte_range\n",
           stdout);
     for (i = 0; i < idx->frame_count; i++) {
         const frame_t *f = &idx->frames[i];
-        char disp[32], poc[32], nalr[64];
+        char disp[32], poc[32], nalr[64], tstr[32], type[8];
         size_t byte_begin = idx->nals.items[f->nal_first].off;
         size_t byte_end = idx->nals.items[f->nal_last].off
                         + idx->nals.items[f->nal_last].size;
@@ -403,26 +446,31 @@ static int do_list(const stream_index_t *idx)
             strcpy(disp, "-");
         else
             snprintf(disp, sizeof(disp), "%lld", f->display_index);
-        if (f->poc < 0)
+        if (!idx->poc_supported || f->parse_error)
             strcpy(poc, "-");
         else
             snprintf(poc, sizeof(poc), "%lld", f->poc);
         snprintf(nalr, sizeof(nalr), "%zu-%zu", f->nal_first, f->nal_last);
+        frame_time_str(idx, f, tstr, sizeof(tstr));
+        snprintf(type, sizeof(type), "%c%s%s", f->pic_type,
+                 f->leading_picture ? "L" : "",
+                 f->recovery_point ? "R" : "");
 
-        printf("%-6zu %-7s %-4c %-3d %-9u %-6s %-12s %zu-%zu\n",
-               i, disp, f->pic_type, f->is_idr ? 1 : 0,
-               (unsigned)f->frame_num, poc, nalr, byte_begin, byte_end);
+        printf("%-6zu %-7s %-4s %-3d %-9u %-6s %-8s %-12s %zu-%zu\n",
+               i, disp, type, f->is_idr ? 1 : 0,
+               (unsigned)f->frame_num, poc, tstr, nalr, byte_begin, byte_end);
     }
     return EXIT_OK;
 }
 
-/* Largest i <= a0 with frames[i].is_idr. 0 on success, -1 if none. */
-static int find_idr_left(const stream_index_t *idx, size_t a0, size_t *out)
+/* Largest i <= a0 usable as a cut anchor (IDR or recovery point).
+ * 0 on success, -1 if none. */
+static int find_anchor_left(const stream_index_t *idx, size_t a0, size_t *out)
 {
     size_t i = a0;
 
     for (;;) {
-        if (idx->frames[i].is_idr) {
+        if (idx->frames[i].usable_anchor) {
             *out = i;
             return 0;
         }
@@ -453,7 +501,8 @@ static int cut_bounds(const stream_index_t *idx, const opts_t *opt,
                       size_t *a0, size_t *b0)
 {
     if (opt->exact_mode) {
-        long double fps;
+        long double fps = 0.0L;
+        int clock_base = 0;
         long long d_min, d_max;
         size_t i;
         size_t lo = 0, hi = 0;
@@ -471,38 +520,91 @@ static int cut_bounds(const stream_index_t *idx, const opts_t *opt,
                 return EXIT_STREAM;
             }
         }
+        /* Time base priority (see time_base_fps): --fps > fixed-fps VUI >
+         * SEI clock ts > VUI timing without the fixed flag (x264 leaves
+         * the flag at 0). */
         if (opt->have_fps) {
             fps = opt->fps;
-        } else if (idx->timing_valid && idx->num_units_in_tick > 0) {
-            fps = (long double)idx->time_scale
-                / (2.0L * (long double)idx->num_units_in_tick);
-        } else {
-            fps = 0.0L;
+        } else if (time_base_fps(idx, &fps) == 0) {
+            /* VUI constant fps. */
+        } else if (idx->clock_timing) {
+            clock_base = 1;
+            ERR("внимание: display-время взято из SEI picture timing (VFR)\n");
         }
-        if (!(fps > 0.0L)) {
-            ERR("VUI timing unavailable; specify --fps\n");
+        if (!clock_base && !(fps > 0.0L)) {
+            ERR("no time base (no fixed-fps VUI timing, no SEI clock ts);"
+                " specify --fps\n");
             return EXIT_STREAM;
         }
 
-        /* Frame d (display_index) is kept iff d/fps < t1 && (d+1)/fps > t0,
-         * i.e. d in [floor(t0*fps), ceil(t1*fps) - 1]. The epsilons keep
-         * exact frame boundaries inclusive despite fp rounding. */
-        d_min = ld_floor_ll(opt->t0 * fps + 1e-9L);
-        d_max = ld_ceil_ll(opt->t1 * fps - 1e-9L) - 1;
-        if (d_min < 0)
-            d_min = 0;
-        for (i = 0; i < idx->frame_count; i++) {
-            long long d = idx->frames[i].display_index;
+        if (clock_base) {
+            /* Frame d occupies [ts(d), ts(d) + dur(d)) in seconds, dur from
+             * the next display-order frame (the last one repeats the
+             * previous duration); kept on any intersection with [t0, t1]. */
+            size_t n = idx->frame_count;
+            size_t *pos = malloc(n * sizeof(*pos));
+            long double prev_dur = 0.0L;
+            long double d;
 
-            if (d >= d_min && d <= d_max) {
-                if (!found) {
-                    lo = hi = i;
-                    found = 1;
+            if (!pos) {
+                ERR("out of memory\n");
+                return EXIT_STREAM;
+            }
+            for (i = 0; i < n; i++) {
+                pos[idx->frames[i].display_index] = i;
+            }
+            for (d = 0; d < (long double)n; d++) {
+                const frame_t *fr = &idx->frames[pos[(size_t)d]];
+                long double start = (long double)fr->clock_ts_90k / 90000.0L;
+                long double dur = 0.0L;
+
+                if ((size_t)d + 1 < n) {
+                    uint64_t nt = idx->frames[pos[(size_t)d + 1]].clock_ts_90k;
+
+                    if (nt > fr->clock_ts_90k) {
+                        dur = (long double)(nt - fr->clock_ts_90k) / 90000.0L;
+                    }
                 } else {
-                    if (i < lo)
-                        lo = i;
-                    if (i > hi)
-                        hi = i;
+                    dur = prev_dur;
+                }
+                if (start < opt->t1 + 1e-9L &&
+                        start + dur > opt->t0 - 1e-9L) {
+                    size_t fi = pos[(size_t)d];
+
+                    if (!found) {
+                        lo = hi = fi;
+                        found = 1;
+                    } else {
+                        if (fi < lo)
+                            lo = fi;
+                        if (fi > hi)
+                            hi = fi;
+                    }
+                }
+                prev_dur = dur;
+            }
+            free(pos);
+        } else {
+            /* Frame d (display_index) is kept iff d/fps < t1 && (d+1)/fps > t0,
+             * i.e. d in [floor(t0*fps), ceil(t1*fps) - 1]. The epsilons keep
+             * exact frame boundaries inclusive despite fp rounding. */
+            d_min = ld_floor_ll(opt->t0 * fps + 1e-9L);
+            d_max = ld_ceil_ll(opt->t1 * fps - 1e-9L) - 1;
+            if (d_min < 0)
+                d_min = 0;
+            for (i = 0; i < idx->frame_count; i++) {
+                long long disp = idx->frames[i].display_index;
+
+                if (disp >= d_min && disp <= d_max) {
+                    if (!found) {
+                        lo = hi = i;
+                        found = 1;
+                    } else {
+                        if (i < lo)
+                            lo = i;
+                        if (i > hi)
+                            hi = i;
+                    }
                 }
             }
         }
@@ -551,21 +653,48 @@ static int do_cut(const stream_index_t *idx, const uint8_t *buf,
         return rc;
 
     /*
-     * Snap the left boundary back to the nearest IDR at or before a0.
+     * Snap the left boundary back to the nearest usable anchor at or
+     * before a0 (closed GOP: an IDR; open GOP: a recovery point with
+     * recovery_frame_cnt == 0 && exact_match && !broken_link).
      * Justification: in decoding order a picture may only reference
      * pictures that PRECEDE it in decoding order, so the segment
-     * [IDR .. b] is self-contained and no right shift is ever needed.
+     * [anchor .. b] is self-contained and no right shift is ever needed.
      */
-    if (find_idr_left(idx, a0, &a) != 0) {
-        ERR("no IDR at or before frame %llu\n", (unsigned long long)a0);
+    if (find_anchor_left(idx, a0, &a) != 0) {
+        ERR("no cut anchor (IDR or recovery point) at or before frame %llu\n",
+            (unsigned long long)a0);
         return EXIT_RANGE;
     }
     if (a != a0) {
-        fprintf(stderr, PROG ": note: left boundary moved from frame %llu"
-                " to IDR frame %llu\n",
-                (unsigned long long)a0, (unsigned long long)a);
+        if (idx->frames[a].recovery_point) {
+            fprintf(stderr, PROG ": левая граница сдвинута к recovery point"
+                    " (кадр %llu)\n", (unsigned long long)a);
+        } else {
+            fprintf(stderr, PROG ": note: left boundary moved from frame %llu"
+                    " to IDR frame %llu\n",
+                    (unsigned long long)a0, (unsigned long long)a);
+        }
     }
     b = b0;
+
+    /* Leading pictures of open GOPs inside the copied range keep
+     * references that lie before their recovery anchor: in copy mode they
+     * decode with broken dependencies. */
+    {
+        size_t k;
+        size_t nlead = 0;
+
+        for (k = a; k <= b; k++) {
+            if (idx->frames[k].leading_picture) {
+                nlead++;
+            }
+        }
+        if (nlead > 0) {
+            ERR("внимание: %zu leading-кадров открытых GOP внутри диапазона"
+                " переносятся с битыми зависимостями"
+                " (перекодирование — --smart, этап R)\n", nlead);
+        }
+    }
 
     /*
      * The cut must open with parameter sets valid for frame a. The index
