@@ -128,20 +128,25 @@ README/HISTORY обновлены.
 
 ## Финальный заход — v1.0
 
-- [ ] **D1.** `common/avcc.{h,c}`: avcC (ISO/IEC 14496-15) parse/build +
+- [x] **D1.** `common/avcc.{h,c}`: avcC (ISO/IEC 14496-15) parse/build +
       конвейер AVCC↔Annex B; бинари `avcc2annexb`/`annexb2avcc`; unit-тесты
       (golden avcC) + интеграция (round-trip, сверка nal_seq).
-- [ ] **D2.** `--list --json` (машинночитаемый вывод, test: json.load).
-- [ ] **B7.** Интерлейс: PAFF поле-пары → картинки, display-порядок 8.21,
+- [x] **D2.** `--list --json` (машинночитаемый вывод, test: json.load).
+- [x] **B7.** Интерлейс: PAFF поле-пары → картинки, display-порядок 8.21,
       вырезка copy-режима целыми картинками; MBAFF = штатные кадры;
       `--smart` интерлейс по-прежнему отказывает (documented).
-- [ ] **C.** `common/iso.{h,c}`: обход боксов, avcC, stts/ctts/stss/stsc/
+- [x] **C.** `common/iso.{h,c}`: обход боксов, avcC, stts/ctts/stss/stsc/
       stsz/stco/co64 → `mp4-cut` v1: одно видео-трек, границы `-f/-t/--exact`,
       пересборка stbl, байтовая идентичность сэмплов, ffprobe-оракул.
-- [ ] **R4.** Правый край `--smart --exact`: trailing-картины открытой GOP,
-      чьё отображение в диапазоне, а декодирование за `to` — попадают в
-      перекодируемое окно (feed_last за `to`).
-- [ ] **CI.** Fresh-clone job (`clone --recursive` + сборка + ctest);
+- [~] **R4.** Правый край `--smart --exact`: trailing-картины открытой GOP,
+      чьё отображение в диапазоне, а декодирование за `to`. Отложено в v1.x:
+      `transcode_range` — окно по порядку декодирования (contiguous), правый
+      край требует выразить «кадр за enc_last, ссылающийся на ещё более
+      поздний IDR» — это ломает контракт и рискует испортить вывод. Худший
+      случай сейчас — кадр пропущен (подвключение по display), вывод остаётся
+      декодируемым и побайтово корректным; лимит документирован. Решение
+      отложено как честное, а не «на авось».
+- [x] **CI.** Fresh-clone job (`clone --recursive` + сборка + ctest);
       релизные артефакты на тегах (бинарь + CHANGELOG из HISTORY).
 - [ ] **v1.0.0**: README (полная картина), HISTORY, тег.
 

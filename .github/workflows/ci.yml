@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
   schedule:
     - cron: "17 3 * * *"
@@ -67,6 +68,91 @@ jobs:
       - uses: actions/checkout@v4
       - name: shellcheck
         run: shellcheck -S warning tests/run.sh tests/fuzz.sh
+
+  fresh-clone:
+    name: fresh clone build (catches uncommitted files)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      # Clone the checked-out tree into a pristine directory over file:// so
+      # only the COMMITTED state is built; a file that was never `git add`ed
+      # (the classic "works because build/ already had it") breaks the build
+      # here, not on the developer's machine.
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ffmpeg libx264-dev libavcodec-dev libavutil-dev
+
+      - name: Clone fresh and build the committed tree
+        run: |
+          git clone --recursive "file://$GITHUB_WORKSPACE" "$RUNNER_TEMP/fresh"
+          cd "$RUNNER_TEMP/fresh"
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)"
+          ctest --test-dir build --output-on-failure
+
+  release:
+    name: release artifacts (on v* tags)
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [build-test, fresh-clone]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ffmpeg libx264-dev libavcodec-dev libavutil-dev
+
+      - name: Configure + build (Release, smart if available)
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)"
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Package binaries + changelog
+        run: |
+          set -e
+          VER="${GITHUB_REF_NAME}"
+          STAGE="dist/h264-editing-utils-$VER-linux-x86_64"
+          mkdir -p "$STAGE"
+          for b in h264-cut mp4-cut avcc2annexb annexb2avcc; do
+            cp "build/source/$b/$b" "$STAGE/"
+          done
+          cp COPYING "$STAGE/COPYING" 2>/dev/null || true
+          cp HISTORY.md "$STAGE/CHANGELOG.md"
+          {
+            echo
+            echo "Динамически слинкованные бинари (Ubuntu runner)."
+            echo "runtime-зависимости h264-cut --smart / mp4-cut:"
+            echo "libx264, libavcodec, libavutil (см. README)."
+          } >> "$STAGE/CHANGELOG.md"
+          cp "$STAGE/CHANGELOG.md" dist/CHANGELOG.md
+          tar -C dist -czf "h264-editing-utils-$VER-linux-x86_64.tar.gz" \
+              "h264-editing-utils-$VER-linux-x86_64"
+          sha256sum "h264-editing-utils-$VER-linux-x86_64.tar.gz" \
+              > "h264-editing-utils-$VER-linux-x86_64.tar.gz.sha256"
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            h264-editing-utils-*-linux-x86_64.tar.gz
+            h264-editing-utils-*-linux-x86_64.tar.gz.sha256
+          body_path: dist/CHANGELOG.md
+          fail_on_unmatched_files: true
 
   nightly:
     name: nightly long fuzz
