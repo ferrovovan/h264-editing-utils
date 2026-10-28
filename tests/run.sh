@@ -1185,6 +1185,100 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# T34: R4 review regression (PLAN): --exact never UNDER-selects frames whose
+#      display time lies in the window - open-GOP fps streams (copy and
+#      smart) and the SEI clock (VFR) stream. Selection oracle: t column of
+#      --list --json (the same base --exact uses). Output count may EXCEED
+#      the selection (decode-window box policy, documented); being below it
+#      is the R4 bug. VFR + --smart without --fps stays a refusal (exit 2).
+# ---------------------------------------------------------------------------
+py_sel() {   # frames of $1 with t in [$2, $3)
+    "$BIN" -l --json "$1" | "$PY" -c '
+import json, sys
+t0, t1 = float(sys.argv[1]), float(sys.argv[2])
+print(sum(1 for f in json.load(sys.stdin)["frames"]
+          if f["t"] is not None and t0 - 1e-9 <= f["t"] < t1 + 1e-9))' "$2" "$3"
+}
+py_cnt() {   # frame count of $1 via our own index
+    "$BIN" -l --json "$1" | "$PY" -c '
+import json, sys
+print(json.load(sys.stdin)["stream"]["frame_count"])'
+}
+
+t34_bad=0
+for w in "0.600:3.200" "1.400:4.450" "2.200:5.250" "3.400:6.450"; do
+    a=${w%:*} b=${w#*:}
+    sel=$(py_sel "$S8" "$a" "$b")
+    if "$BIN" --exact "0:00:$a-0:00:$b" -o "$WORK/t34_copy.264" "$S8" \
+            2>/dev/null; then
+        got=$(py_cnt "$WORK/t34_copy.264")
+        [ "$got" -ge "$sel" ] || { ko "T34 open-GOP copy $a-$b under-selects ($got < $sel)"; t34_bad=$((t34_bad + 1)); }
+    else
+        ko "T34 open-GOP copy $a-$b cut failed"; t34_bad=$((t34_bad + 1))
+    fi
+    if [ "$smart" = 1 ]; then
+        if "$BIN" --smart --exact "0:00:$a-0:00:$b" -o "$WORK/t34_smart.264" "$S8" \
+                2>/dev/null; then
+            got=$(py_cnt "$WORK/t34_smart.264")
+            [ "$got" -ge "$sel" ] || { ko "T34 open-GOP smart $a-$b under-selects ($got < $sel)"; t34_bad=$((t34_bad + 1)); }
+        else
+            ko "T34 open-GOP smart $a-$b cut failed"; t34_bad=$((t34_bad + 1))
+        fi
+    fi
+done
+check_eq "T34 no under-inclusion on open-GOP --exact windows" "0" "$t34_bad"
+
+# VFR (SEI clock ts): copy selects normally; --smart demands an explicit fps
+t34_v=$(py_sel "$S5" 0.500 2.600)
+if "$BIN" --exact 0:00:00.500-0:00:02.600 -o "$WORK/t34_vfr.264" "$S5" \
+        2>/dev/null; then
+    got=$(py_cnt "$WORK/t34_vfr.264")
+    if [ "$got" -ge "$t34_v" ]; then ok_v=yes; else ok_v="under ($got < $t34_v)"; fi
+else
+    ok_v="cut-failed"
+fi
+check_eq "T34 VFR clock stream: copy --exact keeps the selection" "yes" "${ok_v:-no}"
+# VFR clock path: --smart either refuses (no usable fps source at all) or
+# runs via the VUI-timing fallback - both are honest; under-selection is not.
+if [ "$smart" = 1 ]; then
+    "$BIN" --smart --exact 0:00:00.500-0:00:02.600 -o "$WORK/t34_vfrs.264" "$S5" \
+        2>"$WORK/t34_vfrs.err"
+    rc34s=$?
+    if [ "$rc34s" = 2 ]; then
+        if grep -q "частоту кадров" "$WORK/t34_vfrs.err"; then
+            ok34=refused
+        else
+            ok34="rc2 without fps message"
+        fi
+    elif [ "$rc34s" = 0 ]; then
+        got=$(py_cnt "$WORK/t34_vfrs.264")
+        [ "$got" -ge "$t34_v" ] && ok34=clean || ok34="under ($got < $t34_v)"
+    else
+        ok34="rc=$rc34s"
+    fi
+    case "$ok34" in
+        refused) ok "T34 --smart on VFR refuses with a fps message";;
+          clean) ok "T34 --smart on VFR via VUI keeps the selection";;
+              *) ko "T34 --smart on VFR: unexpected ($ok34)";;
+    esac
+else
+    skip_note "T34 --smart VFR variants (no smart support)"
+fi
+if [ "$smart" = 1 ]; then
+    if "$BIN" --smart --fps 25 --exact 0:00:00.500-0:00:02.600 \
+            -o "$WORK/t34_vfrs2.264" "$S5" 2>/dev/null; then
+        got=$(py_cnt "$WORK/t34_vfrs2.264")
+        [ "$got" -ge "$t34_v" ] && ok_v2=yes || ok_v2="under ($got < $t34_v)"
+    else
+        ok_v2="cut-failed"
+    fi
+else
+    ok_v2=skipped
+fi
+case $ok_v2 in yes|skipped) ok "T34 VFR + --smart --fps keeps the selection";;
+                   *) ko "T34 VFR + --smart --fps keeps the selection ($ok_v2)";; esac
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
