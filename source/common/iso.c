@@ -296,6 +296,8 @@ static int build_samples(iso_r *r, const box_t *stbl, iso_video_t *v)
 
     have_ctts = (find_child(r, stbl, "ctts", &ctts) == 0);
     have_stss = (find_child(r, stbl, "stss", &stss) == 0);
+    v->has_ctts = have_ctts;
+    v->has_stss = have_stss;
     rc = find_child(r, stbl, "stsz", &stsz);
     if (rc == -2)
         return -1;
@@ -632,18 +634,18 @@ int iso_open(iso_movie_t *m, const uint8_t *buf, size_t size,
             if (memcmp(handler, "soun", 4) == 0) {
                 m->has_audio = 1;
                 iso_err(&r, "аудио-дорожки не поддерживаются (удалите: ffmpeg -an)");
-                return -1;
+                goto fail;
             }
             if (memcmp(handler, "vide", 4) != 0) {
                 char msg[96];
                 snprintf(msg, sizeof(msg),
                          "дорожка %.4s не поддерживается (нужно видео)", handler);
                 iso_err(&r, msg);
-                return -1;
+                goto fail;
             }
             if (video_found) {
                 iso_err(&r, "несколько видео-дорожек");
-                return -1;
+                goto fail;
             }
             if (parse_video_track(&r, &tk, &m->video) != 0)
                 return -1;
@@ -676,6 +678,329 @@ void iso_close(iso_movie_t *m)
 {
     free(m->video.samples);
     memset(m, 0, sizeof(*m));
+}
+
+/* --- writer: minimal self-contained moov+mdat builder -------------------- */
+typedef struct {
+    uint8_t *b;
+    size_t n, cap;
+    int oom;
+} wb;
+
+static void wneed(wb *x, size_t add)
+{
+    size_t nc;
+    uint8_t *nb;
+    if (x->oom || x->n + add <= x->cap)
+        return;
+    nc = (x->cap ? x->cap * 2 : 1024) + add;
+    nb = realloc(x->b, nc);
+    if (!nb) {
+        x->oom = 1;
+        return;
+    }
+    x->b = nb;
+    x->cap = nc;
+}
+
+static void w32(wb *x, uint32_t v);
+
+static void w64(wb *x, uint64_t v)
+{
+    w32(x, (uint32_t)(v >> 32));
+    w32(x, (uint32_t)v);
+}
+
+static void w32(wb *x, uint32_t v)
+{
+    wneed(x, 4);
+    if (x->oom)
+        return;
+    x->b[x->n++] = (uint8_t)(v >> 24);
+    x->b[x->n++] = (uint8_t)(v >> 16);
+    x->b[x->n++] = (uint8_t)(v >> 8);
+    x->b[x->n++] = (uint8_t)v;
+}
+
+static void wput(wb *x, const void *p, size_t n)
+{
+    wneed(x, n);
+    if (!x->oom) {
+        memcpy(x->b + x->n, p, n);
+        x->n += n;
+    }
+}
+
+static size_t wbox_open(wb *x, const char *f)
+{
+    size_t at = x->n;
+    w32(x, 0);
+    wput(x, f, 4);
+    return at;
+}
+
+static void wbox_close(wb *x, size_t at)
+{
+    uint32_t sz;
+    if (x->oom)
+        return;
+    sz = (uint32_t)(x->n - at);
+    x->b[at] = (uint8_t)(sz >> 24);
+    x->b[at + 1] = (uint8_t)(sz >> 16);
+    x->b[at + 2] = (uint8_t)(sz >> 8);
+    x->b[at + 3] = (uint8_t)sz;
+}
+
+static void wmatrix(wb *x)
+{
+    w32(x, 0x00010000); w32(x, 0);          w32(x, 0);
+    w32(x, 0);          w32(x, 0x00010000); w32(x, 0);
+    w32(x, 0);          w32(x, 0);          w32(x, 0x40000000);
+}
+
+static void wmvhd(wb *x, uint32_t ts, uint32_t dur)
+{
+    size_t at = wbox_open(x, "mvhd");
+    int i;
+    w32(x, 0);              /* version/flags */
+    w32(x, 0); w32(x, 0);   /* creation, modification */
+    w32(x, ts);
+    w32(x, dur);
+    w32(x, 0x00010000);     /* rate 1.0 */
+    w32(x, 0x01000000);     /* volume 1.0 + reserved */
+    w32(x, 0); w32(x, 0);   /* reserved */
+    wmatrix(x);
+    for (i = 0; i < 6; i++)
+        w32(x, 0);          /* pre_defined */
+    w32(x, 2);              /* next_track_ID */
+    wbox_close(x, at);
+}
+
+static void wtkhd(wb *x, uint32_t dur, uint32_t w, uint32_t h)
+{
+    size_t at = wbox_open(x, "tkhd");
+    w32(x, 0x00000003);     /* version 0, flags enabled|in_movie */
+    w32(x, 0); w32(x, 0);   /* creation, modification */
+    w32(x, 1);              /* track_ID */
+    w32(x, 0);              /* reserved */
+    w32(x, dur);
+    w64(x, 0);              /* reserved */
+    w32(x, 0);              /* layer, alternate_group */
+    w32(x, 0);              /* volume, reserved */
+    wmatrix(x);
+    w32(x, w << 16);
+    w32(x, h << 16);
+    wbox_close(x, at);
+}
+
+/* stsd/stts/[ctts]/[stss]/stsc/stsz/stco for samples [a..b], one chunk. */
+static void build_stbl(wb *w, const iso_movie_t *m, size_t a, size_t b)
+{
+    const iso_video_t *v = &m->video;
+    size_t i, n = b - a + 1, at, cnt_at, cnt;
+
+    /* stsd: one entry, the source avc1/avc3 sample entry verbatim. */
+    at = wbox_open(w, "stsd");
+    w32(w, 0); w32(w, 1);
+    wput(w, v->avc1, v->avc1_size);
+    wbox_close(w, at);
+
+    /* stts: run-length of dts_delta. */
+    at = wbox_open(w, "stts");
+    cnt_at = w->n; cnt = 0;
+    w32(w, 0); w32(w, 0);
+    {
+        size_t j = a;
+        while (j <= b) {
+            uint32_t d = v->samples[j].dts_delta;
+            uint32_t c = 0;
+            while (j <= b && v->samples[j].dts_delta == d) {
+                c++;
+                j++;
+            }
+            w32(w, c); w32(w, d);
+            cnt++;
+        }
+    }
+    w->b[cnt_at + 4] = (uint8_t)(cnt >> 24);
+    w->b[cnt_at + 5] = (uint8_t)(cnt >> 16);
+    w->b[cnt_at + 6] = (uint8_t)(cnt >> 8);
+    w->b[cnt_at + 7] = (uint8_t)cnt;
+    wbox_close(w, at);
+
+    /* ctts: preserve composition offsets (pts - dts) so B-frame order holds. */
+    if (v->has_ctts) {
+        at = wbox_open(w, "ctts");
+        cnt_at = w->n; cnt = 0;
+        w32(w, 0); w32(w, 0);
+        {
+            size_t j = a;
+            while (j <= b) {
+                int64_t o = v->samples[j].pts - (int64_t)v->samples[j].dts;
+                uint32_t uo = (uint32_t)(int32_t)o;
+                uint32_t c = 0;
+                while (j <= b
+                        && (uint32_t)(int32_t)(v->samples[j].pts
+                           - (int64_t)v->samples[j].dts) == uo) {
+                    c++;
+                    j++;
+                }
+                w32(w, c); w32(w, uo);
+                cnt++;
+            }
+        }
+        w->b[cnt_at + 4] = (uint8_t)(cnt >> 24);
+        w->b[cnt_at + 5] = (uint8_t)(cnt >> 16);
+        w->b[cnt_at + 6] = (uint8_t)(cnt >> 8);
+        w->b[cnt_at + 7] = (uint8_t)cnt;
+        wbox_close(w, at);
+    }
+
+    /* stss: sync samples (1-based) only when the source had one. */
+    if (v->has_stss) {
+        at = wbox_open(w, "stss");
+        cnt_at = w->n; cnt = 0;
+        w32(w, 0); w32(w, 0);
+        for (i = a; i <= b; i++) {
+            if (v->samples[i].is_sync) {
+                w32(w, (uint32_t)(i - a + 1));
+                cnt++;
+            }
+        }
+        w->b[cnt_at + 4] = (uint8_t)(cnt >> 24);
+        w->b[cnt_at + 5] = (uint8_t)(cnt >> 16);
+        w->b[cnt_at + 6] = (uint8_t)(cnt >> 8);
+        w->b[cnt_at + 7] = (uint8_t)cnt;
+        wbox_close(w, at);
+    }
+
+    /* stsc: one chunk holding all n samples. */
+    at = wbox_open(w, "stsc");
+    w32(w, 0); w32(w, 1);
+    w32(w, 1); w32(w, (uint32_t)n); w32(w, 1);
+    wbox_close(w, at);
+
+    /* stsz: per-sample sizes. */
+    at = wbox_open(w, "stsz");
+    w32(w, 0); w32(w, 0); w32(w, (uint32_t)n);
+    for (i = a; i <= b; i++)
+        w32(w, v->samples[i].size);
+    wbox_close(w, at);
+
+    /* stco: single chunk offset = start of mdat payload. */
+    at = wbox_open(w, "stco");
+    w32(w, 0); w32(w, 1);
+    w32(w, (uint32_t)((uint64_t)m->ftyp_size + 8));
+    wbox_close(w, at);
+}
+int iso_write_cut(const iso_movie_t *m, size_t a, size_t b,
+                  uint8_t **out, size_t *out_size, char *err, size_t errcap)
+{
+    const iso_video_t *v = &m->video;
+    wb w = { 0 };
+    iso_r rr;
+    size_t i, at;
+    uint32_t track_dur = 0, movie_dur = 0;
+    uint64_t mdat_data_off;
+
+    rr.buf = m->buf;
+    rr.size = m->size;
+    rr.err = err;
+    rr.errcap = errcap;
+    if (err && errcap)
+        err[0] = '\0';
+
+    if (a >= v->sample_count || b >= v->sample_count || a > b) {
+        iso_err(&rr, "диапазон вне видео-дорожки");
+        return -1;
+    }
+    if (!m->ftyp || !v->avc1) {
+        iso_err(&rr, "нет ftyp/avc1 для записи");
+        return -1;
+    }
+
+    /* ftyp, then mdat (all cut samples in one chunk), then moov. mdat data
+     * begins at ftyp_size + 8 (mdat box header). */
+    mdat_data_off = (uint64_t)m->ftyp_size + 8;
+    wput(&w, m->ftyp, m->ftyp_size);
+    {
+        size_t mdat_at = wbox_open(&w, "mdat");
+        for (i = a; i <= b; i++) {
+            wput(&w, m->buf + v->samples[i].off, v->samples[i].size);
+            track_dur += v->samples[i].dts_delta;
+        }
+        wbox_close(&w, mdat_at);
+    }
+    if (mdat_data_off + (w.n - mdat_data_off) > 0xFFFFFFFFull
+            || mdat_data_off > 0xFFFFFFFFull) {
+        free(w.b);
+        iso_err(&rr, "результат > 4 ГБ: co64 в writer не реализован");
+        return -1;
+    }
+    if (v->timescale)
+        movie_dur = (uint32_t)((uint64_t)track_dur * m->movie_timescale
+                               / v->timescale);
+
+    at = wbox_open(&w, "moov");
+    wmvhd(&w, m->movie_timescale, movie_dur);
+    {
+        size_t tr = wbox_open(&w, "trak");
+        wtkhd(&w, movie_dur, v->width, v->height);
+        {
+            size_t md = wbox_open(&w, "mdia");
+            size_t mh = wbox_open(&w, "mdhd");
+            w32(&w, 0); w32(&w, 0); w32(&w, 0);
+            w32(&w, v->timescale);
+            w32(&w, track_dur);
+            w32(&w, 0x55C40000);
+            wbox_close(&w, mh);
+            {
+                size_t hd = wbox_open(&w, "hdlr");
+                w32(&w, 0); w32(&w, 0);
+                wput(&w, "vide", 4);
+                w32(&w, 0); w32(&w, 0); w32(&w, 0);
+                wput(&w, "mp4-cut", 8);
+                wbox_close(&w, hd);
+            }
+            {
+                size_t mf = wbox_open(&w, "minf");
+                size_t vh = wbox_open(&w, "vmhd");
+                w32(&w, 0x00000001);
+                w32(&w, 0);
+                wbox_close(&w, vh);
+                {
+                    size_t df = wbox_open(&w, "dinf");
+                    size_t dr = wbox_open(&w, "dref");
+                    w32(&w, 0); w32(&w, 1);
+                    {
+                        size_t u = wbox_open(&w, "url ");
+                        w32(&w, 0x00000001);
+                        wbox_close(&w, u);
+                    }
+                    wbox_close(&w, dr);
+                    wbox_close(&w, df);
+                }
+                {
+                    size_t sb = wbox_open(&w, "stbl");
+                    build_stbl(&w, m, a, b);
+                    wbox_close(&w, sb);
+                }
+                wbox_close(&w, mf);
+            }
+            wbox_close(&w, md);
+        }
+        wbox_close(&w, tr);
+    }
+    wbox_close(&w, at);
+
+    if (w.oom) {
+        free(w.b);
+        iso_err(&rr, "нет памяти");
+        return -1;
+    }
+    *out = w.b;
+    *out_size = w.n;
+    return 0;
 }
 
 int iso_first_sync_at_or_before(const iso_video_t *v, size_t dec_index,

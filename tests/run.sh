@@ -1068,6 +1068,116 @@ check_rc "smoke --smart --list is refused (exit 1)" 1 \
     "$BIN" --smart --list "$S7"
 
 # ---------------------------------------------------------------------------
+# T25..T30: mp4-cut - lossless single-video-track MP4 cutting. The binary
+#      lives next to h264-cut (override with MP4_CUT). ffprobe is the oracle;
+#      a full ffmpeg decode must be silent and the cut ES must be a byte
+#      suffix of the source ES (samples copied byte-for-byte).
+# ---------------------------------------------------------------------------
+MP4CUT="${MP4_CUT:-$BIN_DIR/../mp4-cut/mp4-cut}"
+if [ ! -x "$MP4CUT" ]; then
+    echo "error: mp4-cut not executable: $MP4CUT" >&2
+    exit 2
+fi
+
+mp4_frames() {  # display-order frame count of a video file
+    ffprobe -v error -count_frames -select_streams v:0 \
+        -show_entries stream=nb_read_frames -of csv=p=0 "$1" 2>/dev/null
+}
+mp4_keys() {    # sync (keyframe) packet count, decode order
+    ffprobe -v error -select_streams v:0 -show_entries packet=flags \
+        -of csv=p=0 "$1" 2>/dev/null | grep -c '^K'
+}
+
+if ffmpeg -v error -f lavfi -i testsrc=size=176x144:rate=25:duration=4 \
+        -c:v libx264 -preset ultrafast -g 40 -x264-params scenecut=0 \
+        -pix_fmt yuv420p -an -y "$WORK/src.mp4" 2>"$WORK/mk.err"; then
+
+    # --- T25: --list counts agree with ffprobe -----------------------------
+    check_rc "T25 mp4-cut -l exit code" 0 "$MP4CUT" -l "$WORK/src.mp4"
+    n_mlist=$("$MP4CUT" -l "$WORK/src.mp4" | awk 'NR>1' | wc -l | tr -d ' ')
+    check_eq "T25 -l sample count == ffprobe frames" \
+        "$(mp4_frames "$WORK/src.mp4")" "$n_mlist"
+    n_mkeys=$("$MP4CUT" -l "$WORK/src.mp4" | awk 'NR>1 && $4=="K"' | wc -l | tr -d ' ')
+    check_eq "T25 -l sync samples == ffprobe keyframes" \
+        "$(mp4_keys "$WORK/src.mp4")" "$n_mkeys"
+
+    # --- T26: -f mid-GOP snaps back to the previous IDR, byte-exact --------
+    check_rc "T26 mp4-cut -f 50 exit code" 0 \
+        "$MP4CUT" -f 50 -o "$WORK/c1.mp4" "$WORK/src.mp4"
+    check_eq "T26 -f 50 snaps to IDR@40 -> 60 frames" "60" \
+        "$(mp4_frames "$WORK/c1.mp4")"
+    first_flag=$(ffprobe -v error -select_streams v:0 -show_entries \
+        packet=flags -of csv=p=0 "$WORK/c1.mp4" 2>/dev/null | head -1)
+    case "$first_flag" in K*) eq26=key;; *) eq26="not-key($first_flag)";; esac
+    check_eq "T26 first packet of the cut is a keyframe" "key" "$eq26"
+    check_eq "T26 cut decodes without stderr" "clean" \
+        "$(dec_verdict "$WORK/c1.mp4")"
+    if ffmpeg -v error -y -i "$WORK/src.mp4" -c copy -f h264 "$WORK/src.h264" \
+            && ffmpeg -v error -y -i "$WORK/c1.mp4" -c copy -f h264 "$WORK/c1.h264"; then
+        if "$PY" - "$WORK/src.h264" "$WORK/c1.h264" <<'PYEOF'
+import sys
+a = open(sys.argv[1], "rb").read()
+b = open(sys.argv[2], "rb").read()
+sys.exit(0 if b and b in a else 1)
+PYEOF
+        then eq26b=suffix; else eq26b="not-a-suffix"; fi
+    else
+        eq26b="extract-failed"
+    fi
+    check_eq "T26 cut ES is a byte-suffix of the source ES" "suffix" "$eq26b"
+
+    # --- T27: clean GOP [40..79] -------------------------------------------
+    check_rc "T27 mp4-cut -f 40 -t 79 exit code" 0 \
+        "$MP4CUT" -f 40 -t 79 -o "$WORK/c2.mp4" "$WORK/src.mp4"
+    check_eq "T27 clean GOP -> exactly 40 frames" "40" \
+        "$(mp4_frames "$WORK/c2.mp4")"
+    check_eq "T27 clean-GOP cut decodes without stderr" "clean" \
+        "$(dec_verdict "$WORK/c2.mp4")"
+
+    # --- T28: --exact by display time --------------------------------------
+    check_rc "T28 mp4-cut -e exit code" 0 \
+        "$MP4CUT" -e 0:00:01.600-0:00:03.200 -o "$WORK/c3.mp4" "$WORK/src.mp4"
+    check_eq "T28 -e cut decodes without stderr" "clean" \
+        "$(dec_verdict "$WORK/c3.mp4")"
+    n_c3=$(mp4_frames "$WORK/c3.mp4")
+    if [ "$n_c3" -ge 1 ] 2>/dev/null && [ "$n_c3" -le 100 ] 2>/dev/null; then
+        ok "T28 -e frame count in range (got $n_c3)"
+    else
+        ko "T28 -e frame count out of range (got $n_c3)"
+    fi
+
+    # --- T29: refusals (audio track, fragmented) -> exit 2 -----------------
+    if ffmpeg -v error -f lavfi -i testsrc=size=176x144:rate=25:duration=1 \
+            -f lavfi -i sine -c:v libx264 -c:a aac -shortest \
+            -y "$WORK/aud.mp4" 2>/dev/null; then
+        check_rc "T29 audio track refused (exit 2)" 2 \
+            "$MP4CUT" -f 0 -o "$WORK/x.mp4" "$WORK/aud.mp4"
+    else
+        skip_note "T29 audio refusal (no aac encoder)"
+    fi
+    "$PY" - "$WORK/moof.mp4" <<'PYEOF'
+import struct, sys
+def box(t, p=b""):
+    return struct.pack(">I", 8 + len(p)) + t + p
+open(sys.argv[1], "wb").write(box(b"ftyp", b"isom\x00\x00\x02\x00") + box(b"moof"))
+PYEOF
+    check_rc "T29 fragmented MP4 refused (exit 2)" 2 \
+        "$MP4CUT" -l "$WORK/moof.mp4"
+
+    # --- T30: CLI misuse -> exit 1 -----------------------------------------
+    check_rc "T30 -e with -f is refused (exit 1)" 1 \
+        "$MP4CUT" -e 0:00:00.000-0:00:01.000 -f 5 -o "$WORK/x.mp4" "$WORK/src.mp4"
+    check_rc "T30 -l with -o is refused (exit 1)" 1 \
+        "$MP4CUT" -l -o "$WORK/x.mp4" "$WORK/src.mp4"
+    check_rc "T30 cut without -o is refused (exit 1)" 1 \
+        "$MP4CUT" -f 5 "$WORK/src.mp4"
+    check_rc "T30 -f beyond the track is refused (exit 3)" 3 \
+        "$MP4CUT" -f 100000 -o "$WORK/x.mp4" "$WORK/src.mp4"
+else
+    skip_note "T25..T30 mp4-cut (testsrc/libx264 unavailable)"
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 

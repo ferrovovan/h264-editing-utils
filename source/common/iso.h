@@ -52,6 +52,8 @@ typedef struct {
     iso_sample_t *samples;           /* decoding order; owned, freed by iso_close() */
     size_t sample_count;
     int has_edits;                   /* a non-empty elst was seen (writer drops it) */
+    int has_stss;                    /* the source had an explicit stss box */
+    int has_ctts;                    /* the source had composition offsets */
 } iso_video_t;
 
 typedef struct {
@@ -86,5 +88,17 @@ int iso_first_sync_at_or_before(const iso_video_t *v, size_t dec_index,
  * decoding order; this is a full scan picking the largest index).
  * 0 on success, -1 if no sample qualifies. */
 int iso_last_pts_le(const iso_video_t *v, int64_t pts_ticks, size_t *out);
+
+/*
+ * Serialize a new self-contained MP4 holding the decoding-order sample window
+ * [a, b] (inclusive) of m->video. Sample payloads, the avc1/avc3 description
+ * and the ftyp box are copied byte-for-byte; the sample tables are rebuilt
+ * (stts/stss/stsc/stsz/stco). Composition offsets (pts - dts) are preserved so
+ * B-frame display order survives; track/movie durations and any edit list are
+ * reset to the cut (documented normalization). On success `out`/`out_size` own
+ * a malloc'd buffer (free by caller) and 0 is returned; -1 sets a Russian err.
+ */
+int iso_write_cut(const iso_movie_t *m, size_t a, size_t b,
+                  uint8_t **out, size_t *out_size, char *err, size_t errcap);
 
 #endif /* H264EU_ISO_H */

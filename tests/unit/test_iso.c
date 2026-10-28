@@ -688,6 +688,125 @@ static void test_rejects_container(void)
     free(f.b);
 }
 
+/* Round-trip: cut [a..b] via iso_write_cut, re-parse, compare tables+bytes. */
+static void test_write_roundtrip(void)
+{
+    static const uint32_t stts[] = { 3, 2, 2, 3 };
+    static const uint32_t ctts[] = { 2, 1, 3, 2 };
+    static const uint32_t stss[] = { 1, 4 };
+    static const uint32_t stsc[] = { 1, 3, 2, 2 };
+    static const uint32_t sizes[] = { 10, 12, 8, 12, 10 };
+    static uint8_t sbuf[5][16];
+    const uint8_t *sp[5];
+    struct stbl_spec s;
+    buf_t f = { 0 };
+    iso_movie_t m, m2;
+    uint8_t *out = NULL;
+    size_t out_size = 0, i;
+    char err[256];
+
+    for (i = 0; i < 5; i++) {
+        memset(sbuf[i], (int)i + 0x40, sizeof(sbuf[i]));
+        /* make first `size` bytes meaningful per sample */
+        sp[i] = sbuf[i];
+    }
+    memset(&s, 0, sizeof(s));
+    s.stts = stts; s.stts_n = 2;
+    s.ctts = ctts; s.ctts_n = 2;
+    s.stss = stss; s.stss_n = 2;
+    s.stsc = stsc; s.stsc_n = 2;
+    s.sizes = sizes; s.size_n = 5;
+    build_file(&f, &s, sp);
+    open_ok(&f, &m);
+
+    /* cut samples [1..4] */
+    TEST_ASSERT_EQUAL_INT(0, iso_write_cut(&m, 1, 4, &out, &out_size,
+                                           err, sizeof(err)));
+    TEST_ASSERT_NOT_NULL(out);
+
+    memset(&m2, 0, sizeof(m2));
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, iso_open(&m2, out, out_size, err, sizeof(err)),
+                                  err);
+    TEST_ASSERT_EQUAL_UINT64(4, m2.video.sample_count);
+    TEST_ASSERT_EQUAL_UINT(25, m2.video.timescale);
+    TEST_ASSERT_EQUAL_INT(1, m2.video.has_ctts);
+    TEST_ASSERT_EQUAL_INT(1, m2.video.has_stss);
+
+    for (i = 0; i < 4; i++) {
+        /* sizes preserved */
+        TEST_ASSERT_EQUAL_UINT32(sizes[i + 1], m2.video.samples[i].size);
+        /* payload bytes byte-identical to the source sample */
+        TEST_ASSERT_EQUAL_MEMORY_MESSAGE(
+            m.buf + m.video.samples[i + 1].off,
+            m2.buf + m2.video.samples[i].off,
+            sizes[i + 1], "sample payload differs");
+    }
+    /* sync flags: source is_sync at global {0,3}; cut [1..4] keeps only global 3
+     * -> new index 2. */
+    TEST_ASSERT_EQUAL_INT(0, m2.video.samples[0].is_sync);
+    TEST_ASSERT_EQUAL_INT(0, m2.video.samples[1].is_sync);
+    TEST_ASSERT_EQUAL_INT(1, m2.video.samples[2].is_sync);
+    TEST_ASSERT_EQUAL_INT(0, m2.video.samples[3].is_sync);
+
+    /* composition offsets (pts - dts) preserved per sample */
+    for (i = 0; i < 4; i++) {
+        int64_t src_off = m.video.samples[i + 1].pts
+                        - (int64_t)m.video.samples[i + 1].dts;
+        int64_t new_off = m2.video.samples[i].pts
+                        - (int64_t)m2.video.samples[i].dts;
+        TEST_ASSERT_EQUAL_INT64(src_off, new_off);
+    }
+
+    iso_close(&m2);
+    free(out);
+    iso_close(&m);
+    free(f.b);
+}
+
+/* Full-range cut equals the original table (sizes/sync/bytes). */
+static void test_write_full(void)
+{
+    static const uint32_t stts[] = { 4, 1 };
+    static const uint32_t stsc[] = { 1, 4 };
+    static const uint32_t sizes[] = { 6, 7, 8, 9 };
+    static uint8_t sbuf[4][9];
+    const uint8_t *sp[4];
+    struct stbl_spec s;
+    buf_t f = { 0 };
+    iso_movie_t m, m2;
+    uint8_t *out = NULL;
+    size_t out_size = 0, i;
+    char err[256];
+
+    for (i = 0; i < 4; i++) {
+        memset(sbuf[i], 0x10 + (int)i, sizes[i]);
+        sp[i] = sbuf[i];
+    }
+    memset(&s, 0, sizeof(s));
+    s.stts = stts; s.stts_n = 1;
+    s.stsc = stsc; s.stsc_n = 1;
+    s.sizes = sizes; s.size_n = 4;
+    build_file(&f, &s, sp);
+    open_ok(&f, &m);
+
+    TEST_ASSERT_EQUAL_INT(0, iso_write_cut(&m, 0, 3, &out, &out_size,
+                                           err, sizeof(err)));
+    memset(&m2, 0, sizeof(m2));
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, iso_open(&m2, out, out_size, err, sizeof(err)),
+                                  err);
+    TEST_ASSERT_EQUAL_UINT64(4, m2.video.sample_count);
+    for (i = 0; i < 4; i++) {
+        TEST_ASSERT_EQUAL_UINT32(sizes[i], m2.video.samples[i].size);
+        TEST_ASSERT_EQUAL_INT(1, m2.video.samples[i].is_sync); /* no stss -> all */
+        TEST_ASSERT_EQUAL_MEMORY(sbuf[i], m2.buf + m2.video.samples[i].off,
+                                 sizes[i]);
+    }
+    iso_close(&m2);
+    free(out);
+    iso_close(&m);
+    free(f.b);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -696,5 +815,7 @@ int main(void)
     RUN_TEST(test_edits_flag);
     RUN_TEST(test_rejects);
     RUN_TEST(test_rejects_container);
+    RUN_TEST(test_write_roundtrip);
+    RUN_TEST(test_write_full);
     return UNITY_END();
 }
