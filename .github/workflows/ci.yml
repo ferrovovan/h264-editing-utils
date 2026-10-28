@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  build-test:
+    name: build + ctest (${{ matrix.cc }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_FLAGS="-Werror"
+        env:
+          CC: ${{ matrix.cc }}
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: ctest (unit + integration + fuzz)
+        run: ctest --test-dir build --output-on-failure
+
+  sanitizers:
+    name: ASan + UBSan (integration + fuzz)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENABLE_SANITIZERS=ON
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Fuzz (deterministic seed)
+        run: bash tests/fuzz.sh build/source/h264-cut/h264-cut
+
+      - name: Integration suite under sanitizers
+        run: bash tests/run.sh build/source/h264-cut/h264-cut
+
+  shellcheck:
+    name: shellcheck (test scripts)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck -S warning tests/run.sh tests/fuzz.sh
+
+  nightly:
+    name: nightly long fuzz
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure (sanitizers)
+        run: cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENABLE_SANITIZERS=ON
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      # Non-reproducible seed (CI run id) + 10x mutants vs the PR gate.
+      - name: Long fuzz
+        env:
+          FUZZ_SEED: ${{ github.run_id }}
+          FUZZ_MUTANTS: 600
+        run: bash tests/fuzz.sh build/source/h264-cut/h264-cut

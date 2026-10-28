@@ -1,6 +1,8 @@
 # h264-editing-utils  
 **Коллекция утилит для работы с H.264.**  
 
+[![CI](https://github.com/ferrovovan/h264-editing-utils/actions/workflows/ci.yml/badge.svg)](https://github.com/ferrovovan/h264-editing-utils/actions/workflows/ci.yml)
+
 Проект нацелен на создание инструментов для точной и эффективной работы с видеопотоками H.264.
 
 ## Основные цели проекта

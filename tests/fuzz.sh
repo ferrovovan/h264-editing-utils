@@ -19,6 +19,9 @@
 #
 # Usage: fuzz.sh /path/to/h264-cut   (or H264_CUT=/path/to/h264-cut fuzz.sh)
 #
+# Optional environment: FUZZ_SEED (default 1234, deterministic),
+# FUZZ_MUTANTS (mutants per base stream, default 60).
+#
 # Generates two base streams, mutates them (truncations + bit flips via
 # fuzz_mutate.py, fixed seed) and runs every mutant through --list (and a
 # subset through --exact).  Allowed exit codes: 0, 2, 3.  Any other code,
@@ -42,6 +45,7 @@ fi
 # environment globally disables them.
 unset ASAN_OPTIONS UBSAN_OPTIONS LSAN_OPTIONS
 
+# shellcheck disable=SC1007  # CDPATH= cd — env prefix for the command, not an assignment
 TESTS_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 MUTPY="$TESTS_DIR/fuzz_mutate.py"
 PY=python3
@@ -51,8 +55,8 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/h264cut-fuzz.XXXXXX") || {
 }
 trap 'rm -rf "$WORK"' EXIT
 
-SEED=1234
-PER_BASE=60            # 2 base streams x 60 mutants = 120 total
+SEED="${FUZZ_SEED:-1234}"
+PER_BASE="${FUZZ_MUTANTS:-60}"   # 2 base streams x PER_BASE mutants
 EXACT_EVERY=4          # 120/4 = 30 mutants also run through --exact
 
 gen() { # gen NAME FFMPEG_ARGS...

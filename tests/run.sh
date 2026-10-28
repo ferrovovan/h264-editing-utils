@@ -31,6 +31,7 @@ if [ ! -x "$BIN" ]; then
     exit 2
 fi
 
+# shellcheck disable=SC1007  # CDPATH= cd — env prefix for the command, not an assignment
 TESTS_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 NALPY="$TESTS_DIR/nal_seq.py"
 PY=python3
